@@ -4,12 +4,15 @@
 //! real overseas order, so the type-level read-only guarantee of M1 is replaced by *runtime*
 //! guards (capability + dry-run-by-default + a real-account flag + a pre-trade risk check),
 //! enforced by the `drip tick` use case rather than by the absence of the trait. Endpoints
-//! follow the official `koreainvestment/open-trading-api` reference. Realtime (WebSocket)
-//! quotes, an execution-history endpoint, and order cancellation are later enhancements;
-//! quote rate-limiting (~20 req/s real, ~5 req/s paper) arrives with the polling engine.
+//! follow the official `koreainvestment/open-trading-api` reference. M2.2 adds the overseas
+//! execution-history endpoint (`inquire-ccnl`) as [`AccountQuery::fills_since`], which feeds
+//! fill reconciliation. Realtime (WebSocket) quotes and order cancellation are later
+//! enhancements; quote rate-limiting (~20 req/s real, ~5 req/s paper) arrives with the engine.
 
-use crate::http::today_utc;
-use crate::http::{TokenCache, broker_err, parse_decimal, parse_price_opt, parse_shares};
+use crate::http::{
+    TokenCache, broker_err, parse_decimal, parse_price_opt, parse_shares, parse_yyyymmdd,
+    today_utc, yyyymmdd,
+};
 use async_trait::async_trait;
 use drip_domain::{
     AccountQuery, BrokerId, BrokerInfo, Capabilities, DomainError, Fill, Holding, Money,
@@ -50,7 +53,19 @@ impl KisEnv {
             (KisEnv::Paper, Side::Sell) => "VTTT1001U",
         }
     }
+    /// Execution-history (`inquire-ccnl`) `tr_id`, by environment.
+    fn exec_tr_id(self) -> &'static str {
+        match self {
+            KisEnv::Real => "TTTS3035R",
+            KisEnv::Paper => "VTTS3035R",
+        }
+    }
 }
+
+/// Page cap for paginated `inquire-ccnl`. Generous for a single ticker's history; hitting it
+/// is surfaced as an error rather than silently truncating fills (under-counting would make
+/// the strategy over-buy).
+const MAX_CCNL_PAGES: usize = 50;
 
 /// US exchange for the (single-exchange in M1) KIS instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,10 +301,114 @@ impl AccountQuery for KisBroker {
         Ok(Money::new(parse_decimal(&body.output2.ovrs_stck_evlu_amt)?))
     }
 
-    async fn fills_since(&self, _since: time::Date) -> Result<Vec<Fill>> {
-        Err(DomainError::Unsupported(
-            "KIS execution history is not implemented in M1".into(),
-        ))
+    async fn fills_since(&self, ticker: &Ticker, since: time::Date) -> Result<Vec<Fill>> {
+        let token = self.token().await?;
+        // Clamp a corrupt/future watermark so we never send ORD_STRT_DT > ORD_END_DT.
+        let today = today_utc();
+        let start = yyyymmdd(since.min(today));
+        let end = yyyymmdd(today);
+        // 모의(paper) accepts only the "all" sentinels (PDNO/OVRS_EXCG_CD = ""), so query
+        // broadly and filter to `ticker` client-side; a real account can scope server-side
+        // (PDNO + exchange) for fewer pages. Either way we re-filter by ticker below.
+        // SORT_SQN "DS" (정순 = ascending) returns fills oldest-first — the chronological order
+        // `Position::reconcile`/`apply_day` need to resolve same-day cycle boundaries correctly.
+        let (pdno, excg) = match self.config.environment {
+            KisEnv::Real => (ticker.as_str(), self.config.exchange.excg_code_4()),
+            KisEnv::Paper => ("", ""),
+        };
+
+        let mut fills = Vec::new();
+        let (mut fk, mut nk, mut tr_cont) = (String::new(), String::new(), String::new());
+        for _ in 0..MAX_CCNL_PAGES {
+            let resp = self
+                .client
+                .get(format!(
+                    "{}/uapi/overseas-stock/v1/trading/inquire-ccnl",
+                    self.base
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .header("appkey", &self.config.app_key)
+                .header("appsecret", &self.config.app_secret)
+                .header("tr_id", self.config.environment.exec_tr_id())
+                .header("custtype", "P")
+                .header("tr_cont", tr_cont.as_str())
+                .query(&[
+                    ("CANO", self.config.cano.as_str()),
+                    ("ACNT_PRDT_CD", self.config.product_code.as_str()),
+                    ("PDNO", pdno),
+                    ("ORD_STRT_DT", start.as_str()),
+                    ("ORD_END_DT", end.as_str()),
+                    ("SLL_BUY_DVSN", "00"),
+                    ("CCLD_NCCS_DVSN", "00"),
+                    ("OVRS_EXCG_CD", excg),
+                    ("SORT_SQN", "DS"),
+                    ("ORD_DT", ""),
+                    ("ORD_GNO_BRNO", ""),
+                    ("ODNO", ""),
+                    ("CTX_AREA_FK200", fk.as_str()),
+                    ("CTX_AREA_NK200", nk.as_str()),
+                ])
+                .send()
+                .await
+                .map_err(broker_err)?
+                .error_for_status()
+                .map_err(broker_err)?;
+            // The continuation flag is a response *header*: `M`/`F` mean more pages follow.
+            let more = matches!(
+                resp.headers().get("tr_cont").and_then(|v| v.to_str().ok()),
+                Some("M") | Some("F")
+            );
+            let body: KisExecResp = resp.json().await.map_err(broker_err)?;
+            if body.rt_cd != "0" {
+                return Err(DomainError::Broker(format!(
+                    "KIS inquire-ccnl rt_cd={} {}",
+                    body.rt_cd, body.msg1
+                )));
+            }
+            for row in &body.output {
+                // Skip other tickers (a paper query returns the whole account) and any row
+                // with nothing filled yet.
+                if row.pdno.trim() != ticker.as_str() {
+                    continue;
+                }
+                let shares = parse_shares(&row.ft_ccld_qty)?;
+                if shares.is_zero() {
+                    continue;
+                }
+                let price = parse_price_opt(&row.ft_ccld_unpr3)?.ok_or_else(|| {
+                    DomainError::Broker(format!("KIS fill for {ticker} had no execution price"))
+                })?;
+                // sll_buy_dvsn_cd 01 = 매도 (Sell), 02 = 매수 (Buy) — KIS's universal encoding,
+                // confirmed on the *response* side by the official execution-inquiry output docs
+                // (overseas `chk_inquire_ccld`). An unknown code is a hard error, never a silent
+                // wrong-side fold (which would corrupt shares / P&L / cycle banking).
+                let side = match row.sll_buy_dvsn_cd.trim() {
+                    "02" => Side::Buy,
+                    "01" => Side::Sell,
+                    other => {
+                        return Err(DomainError::Broker(format!(
+                            "KIS fill had unknown sll_buy_dvsn_cd '{other}'"
+                        )));
+                    }
+                };
+                fills.push(Fill {
+                    side,
+                    shares,
+                    price,
+                    at: parse_yyyymmdd(&row.ord_dt)?,
+                });
+            }
+            if !more {
+                return Ok(fills);
+            }
+            fk = body.ctx_area_fk200.trim().to_string();
+            nk = body.ctx_area_nk200.trim().to_string();
+            tr_cont = "N".to_string();
+        }
+        // Ran past the page cap — surface it rather than silently truncating.
+        Err(DomainError::Broker(format!(
+            "KIS inquire-ccnl exceeded {MAX_CCNL_PAGES} pages for {ticker}; narrow the window"
+        )))
     }
 }
 
@@ -437,12 +556,44 @@ struct KisOrderOutput {
     odno: String,
 }
 
+/// `inquire-ccnl` response. Unlike the order endpoint (uppercase `output` object), the
+/// execution list uses lowercase field names and a `output` array, with the pagination keys
+/// in the body. Verified against `koreainvestment/open-trading-api`.
+#[derive(Debug, Deserialize)]
+struct KisExecResp {
+    #[serde(default)]
+    rt_cd: String,
+    #[serde(default)]
+    msg1: String,
+    #[serde(default)]
+    output: Vec<KisExecRow>,
+    #[serde(default)]
+    ctx_area_fk200: String,
+    #[serde(default)]
+    ctx_area_nk200: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KisExecRow {
+    #[serde(default)]
+    ord_dt: String,
+    #[serde(default)]
+    pdno: String,
+    #[serde(default)]
+    sll_buy_dvsn_cd: String,
+    #[serde(default)]
+    ft_ccld_qty: String,
+    #[serde(default)]
+    ft_ccld_unpr3: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use drip_domain::{Price, Shares};
     use rust_decimal_macros::dec;
-    use wiremock::matchers::{body_partial_json, header, method, path};
+    use time::macros::date;
+    use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn config() -> KisConfig {
@@ -665,5 +816,113 @@ mod tests {
             .cancel(&OrderId::new("x"))
             .await;
         assert!(matches!(result, Err(DomainError::Unsupported(_))));
+    }
+
+    #[tokio::test]
+    async fn fills_since_maps_executions_and_filters_unfilled_and_other_tickers() {
+        let server = MockServer::start().await;
+        mock_token(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/uapi/overseas-stock/v1/trading/inquire-ccnl"))
+            .and(header("tr_id", "VTTS3035R")) // paper
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rt_cd": "0", "msg1": "ok", "ctx_area_fk200": "", "ctx_area_nk200": "",
+                "output": [
+                    {"ord_dt": "20260618", "pdno": "TQQQ", "sll_buy_dvsn_cd": "02",
+                     "ft_ccld_qty": "8", "ft_ccld_unpr3": "100.25"},
+                    {"ord_dt": "20260619", "pdno": "TQQQ", "sll_buy_dvsn_cd": "01",
+                     "ft_ccld_qty": "3", "ft_ccld_unpr3": "115.50"},
+                    {"ord_dt": "20260619", "pdno": "TQQQ", "sll_buy_dvsn_cd": "02",
+                     "ft_ccld_qty": "0", "ft_ccld_unpr3": "0"},     // unfilled -> skip
+                    {"ord_dt": "20260619", "pdno": "SOXL", "sll_buy_dvsn_cd": "02",
+                     "ft_ccld_qty": "5", "ft_ccld_unpr3": "30"}     // other ticker -> skip
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let fills = broker(server.uri())
+            .fills_since(&Ticker::new("TQQQ"), date!(2026 - 06 - 01))
+            .await
+            .unwrap();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(
+            fills[0],
+            Fill {
+                side: Side::Buy,
+                shares: Shares::new(8),
+                price: Price::new(dec!(100.25)).unwrap(),
+                at: date!(2026 - 06 - 18),
+            }
+        );
+        assert_eq!(fills[1].side, Side::Sell);
+        assert_eq!(fills[1].shares, Shares::new(3));
+        assert_eq!(fills[1].at, date!(2026 - 06 - 19));
+    }
+
+    #[tokio::test]
+    async fn fills_since_follows_pagination() {
+        let server = MockServer::start().await;
+        mock_token(&server).await;
+        // Page 1: tr_cont "M" (more) + a continuation key in the body.
+        Mock::given(method("GET"))
+            .and(path("/uapi/overseas-stock/v1/trading/inquire-ccnl"))
+            .and(query_param("CTX_AREA_NK200", ""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("tr_cont", "M")
+                    .set_body_json(json!({
+                        "rt_cd": "0", "msg1": "ok", "ctx_area_fk200": "FK2", "ctx_area_nk200": "NK2",
+                        "output": [{"ord_dt": "20260618", "pdno": "TQQQ", "sll_buy_dvsn_cd": "02",
+                                    "ft_ccld_qty": "4", "ft_ccld_unpr3": "100"}]
+                    })),
+            )
+            .mount(&server)
+            .await;
+        // Page 2: requested with the key; tr_cont "D" (done).
+        Mock::given(method("GET"))
+            .and(path("/uapi/overseas-stock/v1/trading/inquire-ccnl"))
+            .and(query_param("CTX_AREA_NK200", "NK2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("tr_cont", "D")
+                    .set_body_json(json!({
+                        "rt_cd": "0", "msg1": "ok", "ctx_area_fk200": "", "ctx_area_nk200": "",
+                        "output": [{"ord_dt": "20260619", "pdno": "TQQQ", "sll_buy_dvsn_cd": "02",
+                                    "ft_ccld_qty": "6", "ft_ccld_unpr3": "98"}]
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let fills = broker(server.uri())
+            .fills_since(&Ticker::new("TQQQ"), date!(2026 - 06 - 01))
+            .await
+            .unwrap();
+        assert_eq!(fills.len(), 2); // both pages collected
+        assert_eq!(fills[0].shares, Shares::new(4));
+        assert_eq!(fills[1].shares, Shares::new(6));
+    }
+
+    #[tokio::test]
+    async fn fills_since_real_scopes_by_ticker_and_tr_id() {
+        let server = MockServer::start().await;
+        mock_token(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/uapi/overseas-stock/v1/trading/inquire-ccnl"))
+            .and(header("tr_id", "TTTS3035R")) // real
+            .and(query_param("PDNO", "TQQQ"))
+            .and(query_param("OVRS_EXCG_CD", "NASD"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rt_cd": "0", "msg1": "ok", "ctx_area_fk200": "", "ctx_area_nk200": "", "output": []
+            })))
+            .mount(&server)
+            .await;
+
+        let fills = broker_with(KisEnv::Real, server.uri())
+            .fills_since(&Ticker::new("TQQQ"), date!(2026 - 06 - 01))
+            .await
+            .unwrap();
+        assert!(fills.is_empty());
     }
 }

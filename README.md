@@ -26,6 +26,9 @@ leveraged ETFs (TQQQ, SOXL, …), and adding your own strategy is a first-class 
 - **Safe order placement** — money is exact decimal (never `f64`); going live is dry-run by
   default, gated by `--live` for real accounts, risk-vetted per order, and idempotent
   (at-most-once — never double-buys); secrets live in a `0600` file, never logged.
+- **Self-reconciling ledger** — `drip reconcile` (and every `drip tick`) folds settled KIS
+  fills into the position, so the cost-averaging tranche counter advances day to day on its
+  own and completed cycles are banked; idempotent (never double-counts a fill).
 
 ## Tech stack
 
@@ -71,6 +74,9 @@ drip tick --name tqqq --execute      # place on a 모의(paper) account
 # A KIS *real* account additionally requires --live:
 #   drip tick --name tqqq --execute --live
 
+# After the US close, fold settled fills into the ledger so T advances (tick does this too).
+drip reconcile --name tqqq
+
 # Toss (read-only)
 drip keys toss --app-key KEY --app-secret SECRET --account-seq 7
 drip account --broker toss
@@ -88,6 +94,7 @@ drip account --broker toss
 | `drip quote <t> --broker` | Fetch a current quote (read-only). |
 | `drip dry-run --name` | Compute today's orders from a live quote (placed: none). |
 | `drip tick --name [--execute] [--live]` | Compute and (with `--execute`) place today's orders on KIS. Dry-run by default; `--live` confirms a real account. |
+| `drip reconcile --name` | Fold settled KIS fills into the position's ledger (advances `T`). Read-only at the broker. |
 | `drip status` | Show persisted positions. |
 | `drip web` | Serve the read-only web dashboard (axum). |
 

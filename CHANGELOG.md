@@ -21,6 +21,11 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
   within a 10× band of the position's average. A single failed check cancels the whole tick.
 - **At-most-once placement.** Placed orders are journaled (sqlite), so re-running `drip tick`
   on the same day never double-places — it would rather skip an order than double-buy.
+- **`drip reconcile` — advance the ledger from broker fills.** Pulls 한국투자증권 (KIS) overseas
+  execution history (`inquire-ccnl`) and folds settled fills into a position, so its tranche
+  counter `T` auto-advances day to day and completed cost-averaging cycles are banked. Read-only
+  at the broker (it places no orders), idempotent (only fills on completed days not yet
+  reconciled are applied — a re-run never double-counts).
 
 ### Changed
 
@@ -29,8 +34,13 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
   instead of being blocked by the type system. **토스증권 (Toss) stays read-only** (it has no
   모의 sandbox).
 - KIS order prices are rounded to the US $0.01 tick before sending.
+- **`drip tick` now reconciles settled fills before deciding**, so today's tranche is computed
+  from an up-to-date ledger rather than a stale one. A preview reconciles in-memory (no state
+  write — like `dry-run`); `--execute` and the standalone `drip reconcile` persist the advance.
 
-> **Limitations (planned for M2.2).** `drip tick` places today's orders only — it does not yet
-> reconcile fills, so a position's tranche counter does not auto-advance between days. Run
-> `drip tick` once per trading day during US market hours (idempotency keys use the UTC date).
-> Toss order placement is not supported.
+> **Limitations.** Idempotency and the reconcile boundary use the **UTC** date, so run
+> `drip tick` / `drip reconcile` once per trading day during US market hours (a proper ET
+> trading calendar arrives with `MarketCalendar`). Reconciliation is per **completed day**
+> (a day's fills are applied once that day is past), which is exact for drip's day orders
+> (LOC / day-limit) but not intended for intraday partial-fill precision. Toss order placement
+> is not supported.

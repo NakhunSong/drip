@@ -6,8 +6,8 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use drip_app::BacktestReport;
 use drip_app::{
-    AccountView, DryRunView, TickPorts, TickStatus, TickView, account_snapshot, dry_run,
-    fetch_quote, list_positions, place_orders, run_backtest,
+    AccountView, DryRunView, ReconcileView, TickPorts, TickStatus, TickView, account_snapshot,
+    dry_run, fetch_quote, list_positions, place_orders, reconcile, run_backtest,
 };
 use drip_brokers::connect;
 use drip_domain::{StateRepository, Ticker};
@@ -82,6 +82,11 @@ enum Command {
         /// Required to place against a KIS *real* (not 모의) account.
         #[arg(long)]
         live: bool,
+    },
+    /// Reconcile settled fills into a position's ledger (advances T). Read-only at the broker.
+    Reconcile {
+        #[arg(long)]
+        name: String,
     },
     /// Show persisted positions.
     Status,
@@ -190,6 +195,9 @@ async fn main() -> Result<()> {
             execute,
             live,
         } => cmd_tick(&name, execute, live, &secrets, &config_path, state_path).await?,
+        Command::Reconcile { name } => {
+            cmd_reconcile(&name, &secrets, &config_path, state_path).await?
+        }
         Command::Status => cmd_status(state_path).await?,
         Command::Web { addr } => drip_web::serve(addr).await?,
     }
@@ -376,6 +384,7 @@ async fn cmd_tick(
     let ports = TickPorts {
         quotes: live_broker.as_quotes(),
         gateway,
+        account: live_broker.as_account(),
         repo: &repo,
         journal: &repo,
     };
@@ -389,6 +398,24 @@ async fn cmd_tick(
     )
     .await?;
     print_tick(name, &view);
+    Ok(())
+}
+
+async fn cmd_reconcile(
+    name: &str,
+    secrets: &FileSecretStore,
+    config_path: &Path,
+    state_path: PathBuf,
+) -> Result<()> {
+    let config = AppConfig::load(config_path)?;
+    let position = config
+        .find(name)
+        .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
+    let live = connect(&position.broker, secrets)?;
+    let repo = SqliteStateRepository::open(state_path)?;
+    let today = time::OffsetDateTime::now_utc().date();
+    let view = reconcile(live.as_account(), &repo, position.to_position()?, today).await?;
+    print_reconcile(name, &view);
     Ok(())
 }
 
@@ -471,6 +498,12 @@ fn print_tick(name: &str, view: &TickView) {
         "Tick {name}: {} @ {} (T={})",
         view.ticker, view.price, view.t
     );
+    if view.reconciled_fills > 0 {
+        println!(
+            "  reconciled {} fill(s) before deciding",
+            view.reconciled_fills
+        );
+    }
     if let Some(note) = &view.note {
         println!("NOTE: {note}");
     }
@@ -505,6 +538,19 @@ fn print_tick(name: &str, view: &TickView) {
         println!(
             "NOTE: preview only — pass --execute to place (KIS 모의 needs --execute; real needs --execute --live)."
         );
+    }
+}
+
+fn print_reconcile(name: &str, view: &ReconcileView) {
+    println!(
+        "Reconcile {name}: {} — applied {} fill(s), {} cycle(s); T {} -> {}",
+        view.ticker, view.applied_fills, view.cycles_completed, view.t_before, view.t_after
+    );
+    if let Some(through) = view.through {
+        println!("  reconciled through {through}");
+    }
+    if let Some(note) = &view.note {
+        println!("NOTE: {note}");
     }
 }
 

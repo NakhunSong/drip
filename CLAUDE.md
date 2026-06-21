@@ -42,6 +42,12 @@ Dependency rule: everything points inward to `drip-domain`. Order of crates:
   aborts the whole tick on any violation; (3) reserves an `OrderJournal` client key *before*
   sending (at-most-once — never double-buys); (4) is dry-run by default (`drip tick` previews,
   `--execute` places). Don't add a placement path that bypasses it.
+- **Fill reconciliation (M2.2)** advances the ledger from broker executions. `Position::reconcile`
+  applies only fills on completed days not yet reconciled (`reconciled_through < date < today`) —
+  idempotent. `place_orders` reconciles before deciding (in-memory for a preview, persisted on
+  `--execute`); never decide on a stale `T`. A fill must never be silently dropped (under-count
+  → over-buy): every drop path is an explicit error.
+  `fills_since` returns fills in chronological order (`apply_day` needs it).
 - Errors map to `DomainError` at adapter boundaries. The CLI uses `anyhow` at the top.
 - Secrets: `FileSecretStore` (`~/.drip/secrets.toml`, `0600`). Never log secret values.
   Secret keys use underscores (`kis_app_key`), never dots (dots are TOML nesting).
@@ -72,12 +78,16 @@ docs/                   # M2 engine design sketch
 - **M1 (done):** domain, 무한매수 v2.2, Paper broker, Backtest, read-only KIS/Toss, CLI, web.
 - **M2.1 (done):** live **KIS** order placement via `drip tick` — `OrderGateway`, pre-trade
   `risk::vet`, at-most-once `OrderJournal`, dry-run default + `--live` real-account gate.
-- **Still out of scope (M2.2+):** fill reconciliation — **the ledger does NOT yet auto-advance
-  `T` from fills; `drip tick` places today's orders only.** Also: US-session scheduler /
-  `drip run` daemon, WebSocket quotes, Rhai strategies, OS-keychain secrets, rate-limiting,
-  notifications, Toss order placement (no 모의 sandbox). Idempotency keys use the **UTC** date,
-  so run `tick` once per day during US hours (proper ET trading-calendar lands with M2.2's
-  `MarketCalendar`). Any further live-trading change is a production-safety change — surface it.
+- **M2.2 (done):** fill reconciliation — `drip reconcile` + KIS `inquire-ccnl`
+  (`AccountQuery::fills_since(ticker, since)`) fold executions into the ledger so `T`
+  auto-advances and cycles bank; `drip tick` reconciles before deciding. Idempotent per
+  completed-day watermark (`Position.reconciled_through`).
+- **Still out of scope (M2+):** US-session scheduler / `drip run` daemon, WebSocket quotes,
+  Rhai strategies, OS-keychain secrets, rate-limiting, notifications, Toss order placement (no
+  모의 sandbox). Idempotency and the reconcile boundary use the **UTC** date, so run
+  `tick`/`reconcile` once per day during US hours (proper ET trading-calendar lands with a
+  future `MarketCalendar`). Any further live-trading change is a production-safety change —
+  surface it.
 
 ## Definition of done
 

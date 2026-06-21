@@ -58,12 +58,19 @@ pub trait Quotes: BrokerInfo {
     async fn quote(&self, ticker: &Ticker) -> Result<Quote>;
 }
 
-/// Read account state. Read-only, hence safe to wire against live brokers in M1.
+/// Read account state. Read-only, hence safe to wire against live brokers.
 #[async_trait]
 pub trait AccountQuery: BrokerInfo {
     async fn holdings(&self) -> Result<Vec<Holding>>;
     async fn balance(&self) -> Result<Money>;
-    async fn fills_since(&self, since: Date) -> Result<Vec<Fill>>;
+    /// Executed fills for `ticker` with a trade date on or after `since`, in **chronological
+    /// (ascending) order** — [`Position::reconcile`] relies on it to resolve same-day cycle
+    /// boundaries. Only filled quantity is reported (a [`Fill`] carries no ticker, so the
+    /// adapter must scope to the one requested). `since` is a lower bound the adapter passes to
+    /// the broker; callers dedup against [`Position::reconciled_through`], so returning a few
+    /// already-seen days is harmless. Adapters that cannot report history return
+    /// [`Unsupported`](crate::DomainError::Unsupported).
+    async fn fills_since(&self, ticker: &Ticker, since: Date) -> Result<Vec<Fill>>;
 }
 
 /// Place and cancel real orders. Deliberately a separate port (Interface Segregation): in
