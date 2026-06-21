@@ -7,5 +7,6 @@ pub mod usecases;
 
 pub use backtest::{Backtest, BacktestReport};
 pub use usecases::{
-    AccountView, DryRunView, account_snapshot, dry_run, fetch_quote, list_positions, run_backtest,
+    AccountView, DryRunView, TickOrder, TickPorts, TickStatus, TickView, account_snapshot, dry_run,
+    fetch_quote, list_positions, place_orders, run_backtest,
 };

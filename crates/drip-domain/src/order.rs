@@ -1,9 +1,10 @@
 //! Broker-neutral order intents — what a strategy *wants* done, before any broker
 //! translates it into a wire-format order.
 
-use crate::market::Side;
+use crate::market::{BrokerId, Side, Ticker};
 use crate::money::{Price, Shares};
 use serde::Serialize;
+use time::Date;
 
 /// Execution style of an order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -61,5 +62,14 @@ impl OrderIntent {
     /// True if this intent is a no-op (zero shares) and can be dropped before sending.
     pub fn is_noop(&self) -> bool {
         self.shares.is_zero()
+    }
+
+    /// A stable idempotency key for this intent on a given trading day. It relies on the
+    /// strategy emitting at most one intent per `tag` per day — true for infinite-buying,
+    /// where each of `loc_low`/`loc_high`/`tp_rest`/`tp_quarter`/`quarter_stop` appears at
+    /// most once. Re-running `drip tick` the same day reproduces identical keys, which the
+    /// [`crate::OrderJournal`] uses to guarantee at-most-once placement.
+    pub fn client_key(&self, broker: BrokerId, ticker: &Ticker, date: Date) -> String {
+        format!("{broker}:{ticker}:{date}:{}", self.tag)
     }
 }

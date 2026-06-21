@@ -6,7 +6,7 @@
 //! objects so use cases can stay broker-agnostic.
 
 use crate::{KisBroker, KisConfig, KisEnv, KisExchange, TossBroker, TossConfig};
-use drip_domain::{AccountQuery, DomainError, Quotes, Result, SecretStore};
+use drip_domain::{AccountQuery, DomainError, OrderGateway, Quotes, Result, SecretStore};
 
 /// A connected live broker, dispatching the read-only ports to the concrete adapter.
 pub enum LiveBroker {
@@ -25,6 +25,16 @@ impl LiveBroker {
         match self {
             LiveBroker::Kis(b) => b,
             LiveBroker::Toss(b) => b,
+        }
+    }
+
+    /// The order-placement port, if this broker supports it. KIS does (M2); Toss does not —
+    /// it has no paper sandbox, so live Toss placement is deferred to a later, separately
+    /// gated increment. Returning `None` keeps Toss read-only.
+    pub fn as_order_gateway(&self) -> Option<&dyn OrderGateway> {
+        match self {
+            LiveBroker::Kis(b) => Some(b),
+            LiveBroker::Toss(_) => None,
         }
     }
 }

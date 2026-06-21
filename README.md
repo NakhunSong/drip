@@ -7,23 +7,25 @@ is designed to be driven by your own Claude Code.
 The flagship strategy is **라오어의 무한매수법 (Laoer's "Infinite Buying", v2.2)** for US
 leveraged ETFs (TQQQ, SOXL, …), and adding your own strategy is a first-class concern.
 
-> ⚠️ **Disclaimer.** Leveraged ETFs are high-risk and this software places (or will place)
-> real orders with real money. Nothing here is financial advice. Always dry-run and paper
-> trade first. Milestone 1 is **read-only** for live brokers — it cannot place live orders.
+> ⚠️ **Disclaimer.** Leveraged ETFs are high-risk and this software can place **real orders
+> with real money** (M2.1: `drip tick --execute` on KIS). Nothing here is financial advice.
+> Always backtest, dry-run, and test on a 모의(paper) account first. Placement is dry-run by
+> default; a real account additionally requires an explicit `--live`.
 
 ## Features
 
 - **Single static binary** — `cargo install` or a prebuilt release; no runtime, no Docker.
 - **Pluggable strategies** — a strategy is a pure function `(state, market) → orders`.
   Built-in 무한매수 v2.2; user strategies (sandboxed Rhai scripts) are the next milestone.
-- **Multi-broker** — capability-based adapters: KIS (REST + paper trading + US overseas),
-  Toss (REST), and a Paper simulator. Live brokers are **read-only by type** in M1.
+- **Multi-broker** — capability-based adapters: KIS (REST, paper trading, US overseas, **live
+  order placement**), Toss (REST, read-only), and a Paper simulator.
 - **Backtesting** — replay daily bars (CSV) with the same fill rules as paper trading;
   reports equity curve, CAGR, and max drawdown.
 - **Web dashboard** — `drip web` serves a read-only dashboard (positions, quotes, backtests)
   from the same single binary; no Node, no build step.
-- **Safe by construction** — money is exact decimal (never `f64`); read-only live brokers
-  cannot place orders (no `OrderGateway` impl); secrets live in a `0600` file, never logged.
+- **Safe order placement** — money is exact decimal (never `f64`); going live is dry-run by
+  default, gated by `--live` for real accounts, risk-vetted per order, and idempotent
+  (at-most-once — never double-buys); secrets live in a `0600` file, never logged.
 
 ## Tech stack
 
@@ -50,7 +52,9 @@ drip backtest --name tqqq --data examples/tqqq-sample.csv
 drip status
 ```
 
-### Connecting a live broker (read-only in M1)
+### Connecting a live broker
+
+KIS supports **live order placement** (M2.1); Toss is read-only.
 
 ```bash
 # KIS — store credentials (validated with a probe quote) in ~/.drip/secrets.toml (0600)
@@ -61,7 +65,13 @@ drip account --broker kis           # holdings + balance (read-only)
 drip quote AAPL --broker kis         # current quote
 drip dry-run --name tqqq             # today's intended orders — NOT placed
 
-# Toss
+# Place today's infinite-buying orders. Dry-run by default; --execute actually sends.
+drip tick --name tqqq                # preview what would be placed (nothing sent)
+drip tick --name tqqq --execute      # place on a 모의(paper) account
+# A KIS *real* account additionally requires --live:
+#   drip tick --name tqqq --execute --live
+
+# Toss (read-only)
 drip keys toss --app-key KEY --app-secret SECRET --account-seq 7
 drip account --broker toss
 ```
@@ -77,6 +87,7 @@ drip account --broker toss
 | `drip account --broker` | Show holdings and balance (read-only). |
 | `drip quote <t> --broker` | Fetch a current quote (read-only). |
 | `drip dry-run --name` | Compute today's orders from a live quote (placed: none). |
+| `drip tick --name [--execute] [--live]` | Compute and (with `--execute`) place today's orders on KIS. Dry-run by default; `--live` confirms a real account. |
 | `drip status` | Show persisted positions. |
 | `drip web` | Serve the read-only web dashboard (axum). |
 

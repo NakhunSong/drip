@@ -6,7 +6,8 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use drip_app::BacktestReport;
 use drip_app::{
-    AccountView, DryRunView, account_snapshot, dry_run, fetch_quote, list_positions, run_backtest,
+    AccountView, DryRunView, TickPorts, TickStatus, TickView, account_snapshot, dry_run,
+    fetch_quote, list_positions, place_orders, run_backtest,
 };
 use drip_brokers::connect;
 use drip_domain::{StateRepository, Ticker};
@@ -70,6 +71,17 @@ enum Command {
     DryRun {
         #[arg(long)]
         name: String,
+    },
+    /// Compute and (with --execute) place today's orders for a position. Dry-run by default.
+    Tick {
+        #[arg(long)]
+        name: String,
+        /// Actually place orders. Omit for a preview that sends nothing.
+        #[arg(long)]
+        execute: bool,
+        /// Required to place against a KIS *real* (not 모의) account.
+        #[arg(long)]
+        live: bool,
     },
     /// Show persisted positions.
     Status,
@@ -173,6 +185,11 @@ async fn main() -> Result<()> {
             to,
         } => cmd_backtest(&name, data, from, to, &config_path).await?,
         Command::DryRun { name } => cmd_dry_run(&name, &secrets, &config_path, state_path).await?,
+        Command::Tick {
+            name,
+            execute,
+            live,
+        } => cmd_tick(&name, execute, live, &secrets, &config_path, state_path).await?,
         Command::Status => cmd_status(state_path).await?,
         Command::Web { addr } => drip_web::serve(addr).await?,
     }
@@ -331,6 +348,50 @@ async fn cmd_dry_run(
     Ok(())
 }
 
+async fn cmd_tick(
+    name: &str,
+    execute: bool,
+    live: bool,
+    secrets: &FileSecretStore,
+    config_path: &Path,
+    state_path: PathBuf,
+) -> Result<()> {
+    let config = AppConfig::load(config_path)?;
+    let position = config
+        .find(name)
+        .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
+    let live_broker = connect(&position.broker, secrets)?;
+    let gateway = live_broker.as_order_gateway().ok_or_else(|| {
+        anyhow!(
+            "broker '{}' does not support order placement (KIS only in M2.1)",
+            position.broker
+        )
+    })?;
+    // The real-account safety gate lives in `place_orders` (drip-app) so every caller
+    // inherits it; `--live` is the user's explicit consent to trade a real account.
+    let registry = StrategyRegistry::with_builtins();
+    let strategy = registry.build(&position.strategy, &position.strategy_params())?;
+    let repo = SqliteStateRepository::open(state_path)?;
+    let today = time::OffsetDateTime::now_utc().date();
+    let ports = TickPorts {
+        quotes: live_broker.as_quotes(),
+        gateway,
+        repo: &repo,
+        journal: &repo,
+    };
+    let view = place_orders(
+        &ports,
+        position.to_position()?,
+        strategy.as_ref(),
+        execute,
+        live,
+        today,
+    )
+    .await?;
+    print_tick(name, &view);
+    Ok(())
+}
+
 async fn cmd_status(state_path: PathBuf) -> Result<()> {
     let repo = SqliteStateRepository::open(state_path)?;
     let positions = list_positions(&repo).await?;
@@ -403,6 +464,48 @@ fn print_dry_run(name: &str, view: &DryRunView) {
         );
     }
     println!("NOTE: dry-run only — no orders were placed.");
+}
+
+fn print_tick(name: &str, view: &TickView) {
+    println!(
+        "Tick {name}: {} @ {} (T={})",
+        view.ticker, view.price, view.t
+    );
+    if let Some(note) = &view.note {
+        println!("NOTE: {note}");
+    }
+    if view.orders.is_empty() {
+        println!("  (no orders today)");
+    }
+    for order in &view.orders {
+        let limit = order
+            .intent
+            .limit
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "MKT".to_string());
+        let status = match &order.status {
+            TickStatus::Placed => "PLACED",
+            TickStatus::SkippedIdempotent => "skip(dup)",
+            TickStatus::WouldPlace => "would-place",
+            TickStatus::Failed => "FAILED",
+        };
+        print!(
+            "  [{status}] {:?} {} {:?} @ {} [{}]",
+            order.intent.side, order.intent.shares, order.intent.kind, limit, order.intent.tag
+        );
+        if let Some(id) = &order.order_id {
+            print!(" id={id}");
+        }
+        if let Some(err) = &order.error {
+            print!(" error={err}");
+        }
+        println!();
+    }
+    if !view.executed {
+        println!(
+            "NOTE: preview only — pass --execute to place (KIS 모의 needs --execute; real needs --execute --live)."
+        );
+    }
 }
 
 fn print_report(report: &BacktestReport) {

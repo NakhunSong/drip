@@ -10,6 +10,7 @@ pub mod money;
 pub mod order;
 pub mod ports;
 pub mod position;
+pub mod risk;
 pub mod settlement;
 
 pub use error::{DomainError, Result};
@@ -17,8 +18,8 @@ pub use market::{Bar, BrokerId, MarketSnapshot, OrderId, Quote, Side, Ticker};
 pub use money::{Money, Percent, Price, Shares};
 pub use order::{OrderIntent, OrderKind};
 pub use ports::{
-    AccountQuery, BrokerInfo, Capabilities, DailyContext, MarketDataSource, OrderGateway, Quotes,
-    SecretStore, StateRepository, Strategy,
+    AccountQuery, BrokerInfo, Capabilities, DailyContext, MarketDataSource, OrderGateway,
+    OrderJournal, Quotes, SecretStore, StateRepository, Strategy,
 };
 pub use position::{Fill, Holding, Position};
 pub use settlement::settle;

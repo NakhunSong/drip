@@ -67,11 +67,24 @@ pub trait AccountQuery: BrokerInfo {
 }
 
 /// Place and cancel real orders. Deliberately a separate port (Interface Segregation): in
-/// M1 only the paper broker implements it.
+/// M1 only the paper broker implements it; M2 adds the KIS live adapter.
 #[async_trait]
 pub trait OrderGateway: BrokerInfo {
     async fn place(&self, ticker: &Ticker, order: &OrderIntent) -> Result<OrderId>;
     async fn cancel(&self, id: &OrderId) -> Result<()>;
+}
+
+/// An idempotency ledger for placed orders. A driving adapter reserves a stable client
+/// key *before* sending an order and records the broker id *after*, so a crash or a
+/// same-day re-run never places the same order twice (at-most-once). Kept separate from
+/// [`StateRepository`] by Interface Segregation, though one sqlite store implements both.
+#[async_trait]
+pub trait OrderJournal: Send + Sync {
+    /// Reserve `key`; `true` if newly reserved, `false` if already present (the caller must
+    /// then skip — the order was placed, or reserved by an earlier run today).
+    async fn reserve(&self, key: &str) -> Result<bool>;
+    /// Attach the broker order id to a previously reserved `key`.
+    async fn record(&self, key: &str, order_id: &OrderId) -> Result<()>;
 }
 
 /// A source of historical daily bars for backtesting.
