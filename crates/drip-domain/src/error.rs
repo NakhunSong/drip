@@ -17,6 +17,9 @@ pub enum DomainError {
     #[error("capability not supported by this broker: {0}")]
     Unsupported(String),
 
+    #[error("risk check failed: {0}")]
+    Risk(String),
+
     #[error("storage error: {0}")]
     Storage(String),
 
