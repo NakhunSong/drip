@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>drip dashboard</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 14px/1.5 system-ui, sans-serif; max-width: 920px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin-top: 1.6rem; }
+    section { border: 1px solid #8884; border-radius: 8px; padding: 1rem; margin-top: 1rem; }
+    table { border-collapse: collapse; width: 100%; } th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #8883; }
+    input, button { font: inherit; padding: 4px 8px; }
+    button { cursor: pointer; border-radius: 6px; border: 1px solid #8886; }
+    pre { background: #8881; padding: .75rem; border-radius: 6px; overflow:auto; }
+    .row { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; }
+    .muted { opacity:.7; }
+  </style>
+</head>
+<body>
+  <h1>drip <span class="muted">dashboard</span></h1>
+  <p class="muted">Read-only. Live brokers cannot place orders in this build.</p>
+
+  <section>
+    <h2>Positions</h2>
+    <button onclick="loadStatus()">Refresh</button>
+    <table id="positions"><thead><tr>
+      <th>broker</th><th>ticker</th><th>T</th><th>avg</th><th>shares</th><th>realized</th><th>cycle</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+
+  <section>
+    <h2>Quote / Account <span class="muted">(read-only)</span></h2>
+    <div class="row">
+      <input id="broker" value="kis" size="6" />
+      <input id="ticker" value="TQQQ" size="8" />
+      <button onclick="getQuote()">Quote</button>
+      <button onclick="getAccount()">Account</button>
+    </div>
+    <pre id="brokerOut" class="muted">—</pre>
+  </section>
+
+  <section>
+    <h2>Backtest</h2>
+    <div class="row">
+      <input id="btName" value="tqqq" size="8" placeholder="position name" />
+      <input id="btData" value="examples/tqqq-sample.csv" size="32" placeholder="csv path" />
+      <button onclick="runBacktest()">Run</button>
+    </div>
+    <pre id="btOut" class="muted">—</pre>
+  </section>
+
+  <script>
+    const j = async (url) => {
+      const r = await fetch(url);
+      const body = await r.json();
+      if (!r.ok) throw new Error(body.error || r.statusText);
+      return body;
+    };
+    async function loadStatus() {
+      const tbody = document.querySelector('#positions tbody');
+      tbody.innerHTML = '<tr><td colspan=7 class=muted>loading…</td></tr>';
+      try {
+        const rows = await j('/api/status');
+        tbody.innerHTML = rows.length ? rows.map(p => `<tr>
+          <td>${p.broker}</td><td>${p.ticker}</td><td>${p.cum_spent}</td>
+          <td>${p.avg_price ?? '-'}</td><td>${p.shares}</td><td>${p.realized_pnl}</td><td>${p.cycle_index}</td>
+        </tr>`).join('') : '<tr><td colspan=7 class=muted>no positions — add one with `drip strategy add`</td></tr>';
+      } catch (e) { tbody.innerHTML = `<tr><td colspan=7>error: ${e.message}</td></tr>`; }
+    }
+    const show = (id, v) => document.getElementById(id).textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+    const broker = () => document.getElementById('broker').value.trim();
+    const ticker = () => document.getElementById('ticker').value.trim();
+    async function getQuote() {
+      try { show('brokerOut', await j(`/api/quote?broker=${broker()}&ticker=${ticker()}`)); }
+      catch (e) { show('brokerOut', 'error: ' + e.message); }
+    }
+    async function getAccount() {
+      try { show('brokerOut', await j(`/api/account?broker=${broker()}`)); }
+      catch (e) { show('brokerOut', 'error: ' + e.message); }
+    }
+    async function runBacktest() {
+      const name = document.getElementById('btName').value.trim();
+      const data = encodeURIComponent(document.getElementById('btData').value.trim());
+      try { show('btOut', await j(`/api/backtest?name=${name}&data=${data}`)); }
+      catch (e) { show('btOut', 'error: ' + e.message); }
+    }
+    loadStatus();
+  </script>
+</body>
+</html>

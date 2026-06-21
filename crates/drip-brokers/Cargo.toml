@@ -1,0 +1,25 @@
+[package]
+name = "drip-brokers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+drip-domain.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rust_decimal = "1.42.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+time = { version = "0.3.49", features = ["macros", "std"] }
+tokio = { version = "1.52.3", features = ["sync"] }
+
+[dev-dependencies]
+rust_decimal_macros = "1.40.0"
+tokio = { version = "1.52.3", features = ["rt", "macros"] }
+wiremock = "0.6.5"

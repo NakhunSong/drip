@@ -1,0 +1,30 @@
+[package]
+name = "drip-infra"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+csv = "1.4.0"
+dirs = "6.0.0"
+drip-domain.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust_decimal = { version = "1.42.1", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+time = { version = "0.3.49", features = ["macros", "parsing", "std"] }
+tokio = { version = "1.52.3", features = ["rt"] }
+toml = "1.1.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+rust_decimal_macros = "1.40.0"
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["rt", "macros"] }

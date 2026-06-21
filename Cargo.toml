@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/drip-domain",
+    "crates/drip-app",
+    "crates/drip-strategies",
+    "crates/drip-brokers",
+    "crates/drip-infra",
+    "crates/drip-cli", "crates/drip-web",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+authors = ["NakhunSong <nak4627@gmail.com>"]
+
+# Centralized lint policy applied to every member via `[lints] workspace = true`.
+# "Money is never an f64" is enforced structurally by the Money(Decimal) newtype,
+# not by a blanket float lint that would fight legitimate metric math (CAGR/MDD).
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# Shared dependency versions live here; members opt in with `dep.workspace = true`.
+# Concrete versions are added per-crate via `cargo add` during each phase to avoid
+# guessing versions, then promoted here as they become shared.
+[workspace.dependencies]
+drip-domain = { path = "crates/drip-domain" }
+drip-app = { path = "crates/drip-app" }
+drip-strategies = { path = "crates/drip-strategies" }
+drip-brokers = { path = "crates/drip-brokers" }
+drip-infra = { path = "crates/drip-infra" }
+
+# Thin release profile tuned for a small, fast single binary.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

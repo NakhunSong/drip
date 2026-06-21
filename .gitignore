@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target
+**/target
+
+# Local secrets / config — never commit
+.env
+.env.*
+*.secret
+
+# Local state databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Scratch UI mockups (disposable)
+.mockups/
+
+# macOS
+.DS_Store
+
+# Docs
+FOR_*.md

@@ -1,0 +1,28 @@
+[package]
+name = "drip-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "drip"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+drip-app.workspace = true
+drip-brokers.workspace = true
+drip-domain.workspace = true
+drip-infra.workspace = true
+drip-strategies.workspace = true
+drip-web = { version = "0.1.0", path = "../drip-web" }
+rust_decimal = "1.42.1"
+serde_json = "1.0.150"
+time = { version = "0.3.49", features = ["macros", "parsing"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
