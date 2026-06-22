@@ -29,6 +29,10 @@ leveraged ETFs (TQQQ, SOXL, …), and adding your own strategy is a first-class 
 - **Self-reconciling ledger** — `drip reconcile` (and every `drip tick`) folds settled KIS
   fills into the position, so the cost-averaging tranche counter advances day to day on its
   own and completed cycles are banked; idempotent (never double-counts a fill).
+- **Scheduler daemon** — `drip run` fires every configured position on its schedule, on US
+  trading days only (NYSE holidays observed, DST-correct); per-position errors are isolated, a
+  missed slot is caught up idempotently within the trading window, and SIGINT/SIGTERM stops it
+  cleanly between fires.
 
 ## Tech stack
 
@@ -77,6 +81,10 @@ drip tick --name tqqq --execute      # place on a 모의(paper) account
 # After the US close, fold settled fills into the ledger so T advances (tick does this too).
 drip reconcile --name tqqq
 
+# Run the scheduler daemon: place every configured position on its daily schedule, on US
+# trading days only. Preview by default; --execute places, --execute --live for a real account.
+drip run                             # Ctrl-C (or SIGTERM) stops it cleanly between fires.
+
 # Toss (read-only)
 drip keys toss --app-key KEY --app-secret SECRET --account-seq 7
 drip account --broker toss
@@ -95,6 +103,7 @@ drip account --broker toss
 | `drip dry-run --name` | Compute today's orders from a live quote (placed: none). |
 | `drip tick --name [--execute] [--live]` | Compute and (with `--execute`) place today's orders on KIS. Dry-run by default; `--live` confirms a real account. |
 | `drip reconcile --name` | Fold settled KIS fills into the position's ledger (advances `T`). Read-only at the broker. |
+| `drip run [--execute] [--live]` | Scheduler daemon: fire every configured position on its daily schedule (US trading days), through the same guarded path as `tick`. Dry-run by default. |
 | `drip status` | Show persisted positions. |
 | `drip web` | Serve the read-only web dashboard (axum). |
 

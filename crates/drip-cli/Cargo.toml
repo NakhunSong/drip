@@ -25,4 +25,5 @@ drip-web = { version = "0.1.0", path = "../drip-web" }
 rust_decimal = "1.42.1"
 serde_json = "1.0.150"
 time = { version = "0.3.49", features = ["macros", "parsing"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tracing = "0.1.44"

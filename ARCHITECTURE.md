@@ -46,7 +46,8 @@ driving adapters (composition roots) — the only crates that know every concret
 
 ## Ports (domain abstractions)
 
-- **`Strategy`** — `decide(&DailyContext) -> Vec<OrderIntent>`. Pure and deterministic; the
+- **`Strategy`** — `decide(&DailyContext) -> Vec<OrderIntent>` plus `triggers() -> Vec<Trigger>`
+  (default: a daily `Schedule`, which the engine wakes it on). Pure and deterministic; the
   primary extension point.
 - **Broker ports, segregated (ISP):** `BrokerInfo` (id + capabilities), `Quotes`,
   `AccountQuery` (holdings, balance, and `fills_since` execution history for reconciliation),
@@ -54,6 +55,9 @@ driving adapters (composition roots) — the only crates that know every concret
   implement `OrderGateway` (M2.1); `TossBroker` does not.
 - **`OrderJournal`** — at-most-once idempotency ledger for placed orders (sqlite).
 - **`MarketDataSource`**, **`StateRepository`**, **`SecretStore`** — infra ports.
+- **Not ports — pure domain logic** (concrete, single-implementation, like `settle`/`risk`):
+  `calendar` (US Eastern trading date, DST, NYSE holidays) and `schedule`
+  (`next_fire`/`is_due` over the trading calendar).
 
 ## Key design decisions (ADR-style)
 
@@ -123,6 +127,33 @@ driving adapter inherits a fresh ledger — no placement on a stale `T`. Under-c
 would make the strategy over-buy, so every drop path (truncated pages, a malformed row) is an
 explicit error, never a silent skip.
 
+### ADR-9: The trading date is the US Eastern session date, not UTC (M2.3)
+**Context:** The at-most-once order key and the reconcile boundary keyed on the UTC date. A US
+(Eastern) session runs into the next UTC day, so an after-hours rerun got a *different* key and
+risked a double-place — the one thing the journal exists to prevent.
+**Decision:** A pure `drip_domain::calendar` resolves the US Eastern date (DST-aware, by
+comparing the UTC instant against the spring/fall transition instants — no date-extraction
+ambiguity) and the NYSE holiday set. The CLI and the scheduler key the trading date off it; KIS
+reports overseas `ord_dt` in exchange-local (Eastern) time, so the reconcile boundary now matches
+the fills it compares against. **Rationale:** a market calendar is a property of the *market*, not
+of any broker, so it belongs in the domain (like `settle`/`risk`), where it is pure and
+exhaustively unit-tested offline — and a single source of truth shared by every adapter.
+
+### ADR-10: The scheduler engine lives in the CLI; the scheduling logic lives in the domain (M2.3)
+**Context:** `drip tick` is a one-shot; M2 also needs an always-on daemon that fires positions on
+a cadence (`drip run`).
+**Decision:** The *decisions* are pure domain: `Strategy::triggers()` declares when to fire
+(default: a daily `Schedule`), and `calendar`/`schedule` compute `next_fire`/`is_due` over the
+trading calendar. The *loop* — sleep until the next fire, fire due jobs, stop on a signal — is a
+thin async module in `drip-cli` (a driving adapter), where `tokio::main` and signal handling
+already live, so `drip-app` stays free of `tokio::time`/`signal`. Each fire goes through the
+existing `place_orders` (never a second placement path). **Rationale:** keeping the brains pure
+makes them testable with a fixed clock and reusable by a future `drip-engine` crate when M3
+streaming sources arrive; the daemon's safety (per-position error isolation, trading-window
+catch-up backed by the idempotent journal, graceful shutdown) is glue around already-proven
+guards. A market calendar gives every `OnTick`/`OnPriceCross` strategy a future seam without a
+core change.
+
 ## Data flow: a backtest
 
 1. CLI loads the position config and builds the strategy via `StrategyRegistry`.
@@ -160,6 +191,22 @@ explicit error, never a silent skip.
    without writing (like `dry-run`). A broker without execution history (Toss) yields a note
    and leaves the ledger untouched, rather than failing.
 
+## Data flow: `drip run` (the scheduler daemon)
+
+1. At startup the CLI resolves every configured position to a broker + strategy + seed template,
+   skipping any read-only broker (Toss) with a warning. Each strategy's `triggers()` yields a
+   `Schedule`.
+2. The engine loop (in `drip-cli`) reads the clock and, for every schedule that `is_due` (today
+   is an Eastern trading day and the time is within `[fire, 16:00)`), fires that position through
+   `place_orders` — the same guarded path as `drip tick` (reconcile → decide → risk-vet →
+   at-most-once placement). A fire's error is logged and isolated; the loop continues.
+3. It then computes the soonest `next_fire` across all schedules (skipping weekends and NYSE
+   holidays) and sleeps until then — or returns immediately on SIGINT/SIGTERM.
+4. Catch-up and restart are safe by construction: firing keys on the Eastern date through the
+   `OrderJournal`, so a daemon launched mid-session (or restarted) re-runs the day without
+   double-placing, and the trading-window bound keeps it from placing an order that cannot fill
+   today.
+
 ## Milestone boundaries
 
 - **M1 (done):** domain + 무한매수 v2.2 + Paper + Backtest + read-only KIS/Toss + CLI + a
@@ -169,7 +216,9 @@ explicit error, never a silent skip.
 - **M2.2 (done):** fill reconciliation — `drip reconcile` + `AccountQuery::fills_since` (KIS
   `inquire-ccnl`) fold executions into the ledger so `T` auto-advances and cycles bank;
   `drip tick` reconciles before deciding.
-- **M2+ (next):** the scheduler / `drip run` daemon (US open/close), an ET `MarketCalendar`
-  (ET-date idempotency), Rhai user strategies, WebSocket quotes, OS-keychain secrets,
-  rate-limiting, notifications. See the [M2 engine sketch](./docs/M2-engine-sketch.md) for the
-  unified always-on/scheduled design.
+- **M2.3 (done):** ET trading-date idempotency (`drip_domain::calendar`, issue #3) + the
+  `drip run` scheduler daemon (`Trigger`/`Schedule`, `Strategy::triggers()`, a pure NYSE trading
+  calendar, issue #4). `drip tick` stays the one-shot path.
+- **M3+ (next):** WebSocket quotes + realtime triggers (`OnTick`/`OnPriceCross`), Rhai user
+  strategies, OS-keychain secrets, rate-limiting, notifications. See the
+  [M2 engine sketch](./docs/M2-engine-sketch.md) for the unified always-on/scheduled design.
