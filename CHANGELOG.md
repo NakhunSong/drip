@@ -47,6 +47,15 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
   An Eastern session runs into the next UTC day, so a UTC key flipped after the close and risked
   a double-place on an after-hours rerun; keying on the Eastern date (DST-aware) is stable.
 
+### Fixed
+
+- **KIS commands now work against a 모의(paper) account.** drip fired several KIS requests per
+  command within the same second, exceeding KIS's per-second limit — which 모의 enforces strictly
+  (it rejects the burst with `EGW00201` "초당 거래건수 초과", wrapped in an HTTP 500). So
+  `drip tick` / `drip run` failed on the quote after reconciling, and `drip account` failed to
+  read the balance. Every KIS request is now spaced under the broker's per-second limit, so
+  multi-call commands run cleanly.
+
 > **Limitations.** Reconciliation is per **completed day** (a day's fills are applied once that
 > day is past), which is exact for drip's day orders (LOC / day-limit) but not intended for
 > intraday partial-fill precision. The scheduler fires on a daily cadence only — realtime

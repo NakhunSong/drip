@@ -106,3 +106,57 @@ impl TokenCache {
         Ok(token)
     }
 }
+
+/// A simple async rate limiter that spaces successive [`acquire`](RateLimiter::acquire) calls by
+/// at least `min_interval`. KIS throttles per second — 모의 strictly (≈1/s; it returns
+/// `EGW00201` "초당 거래건수 초과" otherwise), 실전 ≈20/s — so every KIS request acquires this
+/// first. The lock is held across the wait, which serializes callers and guarantees the spacing
+/// even under concurrency.
+#[derive(Debug)]
+pub(crate) struct RateLimiter {
+    min_interval: Duration,
+    last: Mutex<Option<Instant>>,
+}
+
+impl RateLimiter {
+    pub(crate) fn new(min_interval: Duration) -> RateLimiter {
+        RateLimiter {
+            min_interval,
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Wait until at least `min_interval` has elapsed since the previous acquire, then record the
+    /// new time. A zero interval makes this a no-op (used by tests so they don't sleep).
+    pub(crate) async fn acquire(&self) {
+        let mut last = self.last.lock().await;
+        if let Some(prev) = *last {
+            let elapsed = prev.elapsed();
+            if elapsed < self.min_interval {
+                tokio::time::sleep(self.min_interval - elapsed).await;
+            }
+        }
+        *last = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rate_limiter_spaces_successive_acquires() {
+        let limiter = RateLimiter::new(Duration::from_millis(40));
+        let start = Instant::now();
+        limiter.acquire().await; // first is immediate (no prior)
+        limiter.acquire().await; // second waits out the interval
+        assert!(
+            start.elapsed() >= Duration::from_millis(40),
+            "two acquires should be spaced by at least the interval"
+        );
+    }
+
+    // A zero interval (used by the test brokers so the suite never sleeps) is exercised
+    // implicitly by every multi-call wiremock test; a wall-clock upper-bound assertion here
+    // would only add CI flakiness, so it is intentionally not tested by timing.
+}
