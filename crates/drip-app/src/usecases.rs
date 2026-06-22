@@ -54,9 +54,29 @@ pub struct DryRunView {
     pub intents: Vec<OrderIntent>,
 }
 
-/// Load state, fetch a quote, and run the strategy — the shared first half of `dry_run`
-/// and `place_orders`. Returns the effective position state (saved state, or `template`
-/// when none is persisted), the quote, and the decided intents.
+/// Fetch a quote for `state`'s ticker and run the strategy on it — the decide half shared by
+/// `compute_intents` (which loads `state` from the repo) and `place_orders` (which gets it
+/// from the reconcile step).
+async fn decide_on(
+    quotes: &dyn Quotes,
+    state: &Position,
+    strategy: &dyn Strategy,
+) -> Result<(Quote, Vec<OrderIntent>)> {
+    let quote = quotes.quote(&state.ticker).await?;
+    let market = MarketSnapshot {
+        ticker: state.ticker.clone(),
+        price: quote.price,
+        as_of: quote.as_of,
+    };
+    let intents = strategy.decide(&DailyContext {
+        position: state,
+        market: &market,
+    });
+    Ok((quote, intents))
+}
+
+/// Load state and run the strategy — the first half of `dry_run`. Returns the effective
+/// position state (saved state, or `template` when none is persisted), the quote, and intents.
 async fn compute_intents(
     quotes: &dyn Quotes,
     repo: &dyn StateRepository,
@@ -65,17 +85,8 @@ async fn compute_intents(
 ) -> Result<(Position, Quote, Vec<OrderIntent>)> {
     let broker = template.broker;
     let ticker = template.ticker.clone();
-    let quote = quotes.quote(&ticker).await?;
     let state = repo.load(broker, &ticker).await?.unwrap_or(template);
-    let market = MarketSnapshot {
-        ticker,
-        price: quote.price,
-        as_of: quote.as_of,
-    };
-    let intents = strategy.decide(&DailyContext {
-        position: &state,
-        market: &market,
-    });
+    let (quote, intents) = decide_on(quotes, &state, strategy).await?;
     Ok((state, quote, intents))
 }
 
@@ -97,11 +108,101 @@ pub async fn dry_run(
     })
 }
 
+/// How far back to scan for fills on a position's first reconcile (before any watermark
+/// exists). KIS overseas execution history is bounded (~3 months); 90 days comfortably covers
+/// an infinite-buying cost-averaging cycle.
+const RECONCILE_LOOKBACK_DAYS: i64 = 90;
+
+fn earliest_reconcile_window(today: Date) -> Date {
+    today.saturating_sub(time::Duration::days(RECONCILE_LOOKBACK_DAYS))
+}
+
+/// What a [`reconcile`] did to a position's ledger.
+#[derive(Debug, Serialize)]
+pub struct ReconcileView {
+    pub ticker: Ticker,
+    pub applied_fills: usize,
+    pub cycles_completed: u32,
+    pub t_before: Decimal,
+    pub t_after: Decimal,
+    pub through: Option<Date>,
+    /// Set only when the broker cannot report fills — the ledger was left unchanged.
+    pub note: Option<String>,
+}
+
+/// Pull settled fills from the broker and fold them into the position's ledger, advancing the
+/// tranche counter as fills accumulate and banking completed cycles. Idempotent: only fills on
+/// completed days not yet reconciled are applied (see [`Position::reconcile`]), so running it
+/// repeatedly — or right after a crash — never double-counts. It is read-only at the broker
+/// (no orders are placed), so it needs no real-account consent. A broker that cannot report
+/// execution history yields a note and leaves the ledger untouched, rather than failing.
+pub async fn reconcile(
+    account: &dyn AccountQuery,
+    repo: &dyn StateRepository,
+    template: Position,
+    today: Date,
+) -> Result<ReconcileView> {
+    let (_, view) = reconcile_into(account, repo, template, today, true).await?;
+    Ok(view)
+}
+
+/// Reconcile into an in-memory `Position`, persisting the advance only when `persist`. This lets
+/// a `drip tick` preview show an up-to-date ledger without mutating stored state, while
+/// `--execute` (and the standalone [`reconcile`]) commit it. Returns the reconciled position so
+/// the caller can decide on it without a reload.
+async fn reconcile_into(
+    account: &dyn AccountQuery,
+    repo: &dyn StateRepository,
+    template: Position,
+    today: Date,
+    persist: bool,
+) -> Result<(Position, ReconcileView)> {
+    let broker = template.broker;
+    let ticker = template.ticker.clone();
+    let mut state = repo.load(broker, &ticker).await?.unwrap_or(template);
+    let t_before = state.t();
+    let since = state
+        .reconciled_through
+        .unwrap_or_else(|| earliest_reconcile_window(today));
+
+    let view = match account.fills_since(&ticker, since).await {
+        Ok(fills) => {
+            let outcome = state.reconcile(&fills, today);
+            if persist && outcome.applied > 0 {
+                repo.save(&state).await?;
+            }
+            ReconcileView {
+                ticker: ticker.clone(),
+                applied_fills: outcome.applied,
+                cycles_completed: outcome.cycles_completed,
+                t_before,
+                t_after: state.t(),
+                through: outcome.through,
+                note: None,
+            }
+        }
+        // A broker without execution history can't auto-advance; surface it but don't fail the
+        // caller (a tick should still place today's orders from the stored ledger).
+        Err(DomainError::Unsupported(msg)) => ReconcileView {
+            ticker: ticker.clone(),
+            applied_fills: 0,
+            cycles_completed: 0,
+            t_before,
+            t_after: t_before,
+            through: state.reconciled_through,
+            note: Some(format!("fills not reconciled: {msg}")),
+        },
+        Err(e) => return Err(e),
+    };
+    Ok((state, view))
+}
+
 /// The ports a tick drives. Bundling them keeps `place_orders` to a small signature and
 /// lets a driving adapter wire one sqlite store as both `repo` and `journal`.
 pub struct TickPorts<'a> {
     pub quotes: &'a dyn Quotes,
     pub gateway: &'a dyn OrderGateway,
+    pub account: &'a dyn AccountQuery,
     pub repo: &'a dyn StateRepository,
     pub journal: &'a dyn OrderJournal,
 }
@@ -135,8 +236,10 @@ pub struct TickView {
     pub price: Price,
     pub t: Decimal,
     pub executed: bool,
+    /// Fills folded into the ledger by the reconcile step that runs before deciding.
+    pub reconciled_fills: usize,
     pub orders: Vec<TickOrder>,
-    /// An informational note, e.g. KIS 모의 degrading LOC orders to day-limits.
+    /// Informational notes, e.g. reconcile being unavailable or KIS 모의 degrading LOC orders.
     pub note: Option<String>,
 }
 
@@ -166,8 +269,16 @@ pub async fn place_orders(
                 .into(),
         ));
     }
-    let (state, quote, intents) =
-        compute_intents(ports.quotes, ports.repo, template, strategy).await?;
+    // Bring the ledger up to date from settled fills *before* deciding today's tranche, so T
+    // reflects reality, then decide on that in-memory state. Persist the advance only when
+    // executing — a preview reconciles in-memory (accurate) but must not mutate stored state.
+    // Read-only at the broker, so it runs regardless of --live; every caller (CLI, future
+    // scheduler) inherits a fresh ledger — no placement on a stale T.
+    let (state, recon) =
+        reconcile_into(ports.account, ports.repo, template, today, execute).await?;
+    let reconciled_fills = recon.applied_fills;
+
+    let (quote, intents) = decide_on(ports.quotes, &state, strategy).await?;
     let intents: Vec<OrderIntent> = intents.into_iter().filter(|i| !i.is_noop()).collect();
 
     // Pre-flight: vet every intent first; any violation aborts the entire tick.
@@ -177,13 +288,21 @@ pub async fn place_orders(
 
     let broker = state.broker;
     let ticker = state.ticker.clone();
-    let note = (ports.gateway.capabilities().paper_account
-        && intents.iter().any(|i| i.kind == OrderKind::LimitOnClose))
-    .then(|| {
-        "KIS 모의(paper) accepts only limit orders; LOC legs are sent as plain day-limits at \
-         the leg's limit price (not a true LOC), so they may fill intraday, not at the close"
-            .to_string()
-    });
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(n) = recon.note {
+        notes.push(n);
+    }
+    if ports.gateway.capabilities().paper_account
+        && intents.iter().any(|i| i.kind == OrderKind::LimitOnClose)
+    {
+        notes.push(
+            "KIS 모의(paper) accepts only limit orders; LOC legs are sent as plain day-limits \
+             at the leg's limit price (not a true LOC), so they may fill intraday, not at the \
+             close"
+                .to_string(),
+        );
+    }
+    let note = (!notes.is_empty()).then(|| notes.join(" | "));
 
     let mut orders = Vec::with_capacity(intents.len());
     for intent in intents {
@@ -238,6 +357,7 @@ pub async fn place_orders(
         price: quote.price,
         t: state.t(),
         executed: execute,
+        reconciled_fills,
         orders,
         note,
     })
@@ -261,8 +381,8 @@ mod tests {
     use super::*;
     use drip_brokers::PaperBroker;
     use drip_domain::{
-        Bar, BrokerInfo, Capabilities, OrderGateway, OrderId, OrderJournal, Price as DomainPrice,
-        Shares,
+        Bar, BrokerInfo, Capabilities, Fill, OrderGateway, OrderId, OrderJournal,
+        Price as DomainPrice, Shares, Side,
     };
     use drip_strategies::{InfiniteBuying, InfiniteBuyingConfig};
     use rust_decimal_macros::dec;
@@ -385,6 +505,7 @@ mod tests {
         let ports = TickPorts {
             quotes: &pb,
             gateway: &pb,
+            account: &pb,
             repo: &FlatRepo,
             journal: &journal,
         };
@@ -431,6 +552,7 @@ mod tests {
         let ports = TickPorts {
             quotes: &pb,
             gateway: &pb,
+            account: &pb,
             repo: &FlatRepo,
             journal: &journal,
         };
@@ -470,6 +592,7 @@ mod tests {
         let ports = TickPorts {
             quotes: &pb,
             gateway: &gateway,
+            account: &pb,
             repo: &FlatRepo,
             journal: &journal,
         };
@@ -496,6 +619,211 @@ mod tests {
                 .orders
                 .iter()
                 .all(|o| matches!(o.status, TickStatus::Placed))
+        );
+    }
+
+    // A state repository that persists in memory — exercises reconcile's save/reload (FlatRepo
+    // is always empty, so it can't show the ledger advancing).
+    #[derive(Default)]
+    struct MemRepo(std::sync::Mutex<std::collections::HashMap<(BrokerId, String), Position>>);
+    #[async_trait::async_trait]
+    impl StateRepository for MemRepo {
+        async fn load(&self, b: BrokerId, t: &Ticker) -> Result<Option<Position>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(&(b, t.as_str().to_string()))
+                .cloned())
+        }
+        async fn save(&self, p: &Position) -> Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert((p.broker, p.ticker.as_str().to_string()), p.clone());
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<Position>> {
+            Ok(self.0.lock().unwrap().values().cloned().collect())
+        }
+    }
+
+    // An account that replays canned fills, filtered by `since` like a real adapter.
+    struct CannedAccount {
+        fills: Vec<Fill>,
+    }
+    impl BrokerInfo for CannedAccount {
+        fn id(&self) -> BrokerId {
+            BrokerId::Paper
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                realtime_quotes: false,
+                paper_account: true,
+                order_placement: true,
+                overseas: true,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl AccountQuery for CannedAccount {
+        async fn holdings(&self) -> Result<Vec<Holding>> {
+            Ok(vec![])
+        }
+        async fn balance(&self) -> Result<Money> {
+            Ok(Money::ZERO)
+        }
+        async fn fills_since(&self, _ticker: &Ticker, since: time::Date) -> Result<Vec<Fill>> {
+            Ok(self
+                .fills
+                .iter()
+                .filter(|f| f.at >= since)
+                .cloned()
+                .collect())
+        }
+    }
+
+    // An account whose broker cannot report execution history (e.g. Toss).
+    struct NoHistoryAccount;
+    impl BrokerInfo for NoHistoryAccount {
+        fn id(&self) -> BrokerId {
+            BrokerId::Toss
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+    #[async_trait::async_trait]
+    impl AccountQuery for NoHistoryAccount {
+        async fn holdings(&self) -> Result<Vec<Holding>> {
+            Ok(vec![])
+        }
+        async fn balance(&self) -> Result<Money> {
+            Ok(Money::ZERO)
+        }
+        async fn fills_since(&self, _ticker: &Ticker, _since: time::Date) -> Result<Vec<Fill>> {
+            Err(DomainError::Unsupported("no history".into()))
+        }
+    }
+
+    fn paper_template() -> Position {
+        Position::new(
+            BrokerId::Paper,
+            Ticker::new("TQQQ"),
+            Money::new(dec!(32000)),
+            40,
+        )
+    }
+    fn buy_fill(shares: u32, price: Decimal, at: time::Date) -> Fill {
+        Fill {
+            side: Side::Buy,
+            shares: Shares::new(shares),
+            price: DomainPrice::new(price).unwrap(),
+            at,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_applies_fills_persists_and_is_idempotent() {
+        let repo = MemRepo::default();
+        repo.save(&paper_template()).await.unwrap();
+        let account = CannedAccount {
+            fills: vec![
+                buy_fill(8, dec!(100), date!(2026 - 06 - 18)),
+                buy_fill(8, dec!(100), date!(2026 - 06 - 19)),
+            ],
+        };
+        let today = date!(2026 - 06 - 21);
+
+        let view = reconcile(&account, &repo, paper_template(), today)
+            .await
+            .unwrap();
+        assert_eq!(view.applied_fills, 2);
+        assert_eq!(view.through, Some(date!(2026 - 06 - 19)));
+        assert!(view.t_after > view.t_before);
+        assert!(view.note.is_none());
+
+        // Persisted: a reloaded position reflects the fills and the watermark.
+        let saved = repo
+            .load(BrokerId::Paper, &Ticker::new("TQQQ"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.shares, Shares::new(16));
+        assert_eq!(saved.reconciled_through, Some(date!(2026 - 06 - 19)));
+
+        // Idempotent: a second run applies nothing new.
+        let again = reconcile(&account, &repo, paper_template(), today)
+            .await
+            .unwrap();
+        assert_eq!(again.applied_fills, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_notes_and_skips_when_history_unsupported() {
+        let repo = MemRepo::default();
+        let view = reconcile(
+            &NoHistoryAccount,
+            &repo,
+            paper_template(),
+            date!(2026 - 06 - 21),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.applied_fills, 0);
+        assert!(view.note.is_some());
+    }
+
+    #[tokio::test]
+    async fn place_orders_reconciles_in_memory_for_preview_persists_on_execute() {
+        let pb = PaperBroker::new(Money::new(dec!(0)));
+        pb.set_market(Ticker::new("TQQQ"), bar(dec!(100)));
+        let strategy = InfiniteBuying::new(InfiniteBuyingConfig::default());
+        let journal = MemJournal::default();
+        let repo = MemRepo::default();
+        repo.save(&paper_template()).await.unwrap();
+        // A completed-day buy the tick folds in before deciding today's tranche.
+        let account = CannedAccount {
+            fills: vec![buy_fill(8, dec!(100), date!(2026 - 06 - 18))],
+        };
+        let ports = TickPorts {
+            quotes: &pb,
+            gateway: &pb,
+            account: &account,
+            repo: &repo,
+            journal: &journal,
+        };
+        let today = date!(2026 - 06 - 21);
+
+        // Preview (execute = false): the reconcile shows in the view (accurate T) but is NOT
+        // written to the repo — a preview must not mutate the stored ledger.
+        let preview = place_orders(&ports, paper_template(), &strategy, false, false, today)
+            .await
+            .unwrap();
+        assert_eq!(preview.reconciled_fills, 1);
+        assert_eq!(preview.t, dec!(1)); // 8 * 100 = 800 against an 800 budget -> T = 1.0
+        let after_preview = repo
+            .load(BrokerId::Paper, &Ticker::new("TQQQ"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after_preview.is_flat()); // preview left the stored ledger untouched
+        assert_eq!(after_preview.reconciled_through, None);
+
+        // Execute: the same reconcile is now persisted.
+        let executed = place_orders(&ports, paper_template(), &strategy, true, false, today)
+            .await
+            .unwrap();
+        assert_eq!(executed.reconciled_fills, 1);
+        let after_execute = repo
+            .load(BrokerId::Paper, &Ticker::new("TQQQ"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_execute.shares, Shares::new(8)); // execute persisted the advance
+        assert_eq!(
+            after_execute.reconciled_through,
+            Some(date!(2026 - 06 - 18))
         );
     }
 }

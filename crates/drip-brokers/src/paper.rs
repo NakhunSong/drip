@@ -20,7 +20,7 @@ struct PaperState {
     holdings: HashMap<Ticker, Holding>,
     quotes: HashMap<Ticker, Quote>,
     bars: HashMap<Ticker, Bar>,
-    fills: Vec<Fill>,
+    fills: Vec<(Ticker, Fill)>,
     next_id: u64,
 }
 
@@ -103,13 +103,13 @@ impl AccountQuery for PaperBroker {
     async fn balance(&self) -> Result<Money> {
         Ok(self.lock().cash)
     }
-    async fn fills_since(&self, since: Date) -> Result<Vec<Fill>> {
+    async fn fills_since(&self, ticker: &Ticker, since: Date) -> Result<Vec<Fill>> {
         Ok(self
             .lock()
             .fills
             .iter()
-            .filter(|f| f.at >= since)
-            .cloned()
+            .filter(|(t, f)| t == ticker && f.at >= since)
+            .map(|(_, f)| f.clone())
             .collect())
     }
 }
@@ -150,7 +150,7 @@ impl OrderGateway for PaperBroker {
                     Side::Buy => state.cash -= fill.value(),
                     Side::Sell => state.cash += fill.value(),
                 }
-                state.fills.push(fill);
+                state.fills.push((ticker.clone(), fill));
             }
         }
         Ok(id)

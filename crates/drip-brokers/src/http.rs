@@ -25,6 +25,30 @@ pub(crate) fn parse_decimal(raw: &str) -> Result<Decimal> {
         .map_err(|e| DomainError::Broker(format!("invalid number '{raw}': {e}")))
 }
 
+/// Format a date as KIS's `YYYYMMDD` (no separators), used for order/execution date ranges.
+pub(crate) fn yyyymmdd(date: time::Date) -> String {
+    format!(
+        "{:04}{:02}{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day()
+    )
+}
+
+/// Parse KIS's `YYYYMMDD` date string into a [`time::Date`].
+pub(crate) fn parse_yyyymmdd(raw: &str) -> Result<time::Date> {
+    let s = raw.trim();
+    let bad = || DomainError::Broker(format!("invalid KIS date '{raw}'"));
+    if s.len() != 8 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let year: i32 = s[0..4].parse().map_err(|_| bad())?;
+    let month =
+        time::Month::try_from(s[4..6].parse::<u8>().map_err(|_| bad())?).map_err(|_| bad())?;
+    let day: u8 = s[6..8].parse().map_err(|_| bad())?;
+    time::Date::from_calendar_date(year, month, day).map_err(|_| bad())
+}
+
 /// Parse a positive price; empty or non-positive input becomes `None` (e.g. a flat lot).
 pub(crate) fn parse_price_opt(raw: &str) -> Result<Option<Price>> {
     let trimmed = raw.trim();

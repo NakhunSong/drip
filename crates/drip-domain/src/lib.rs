@@ -21,5 +21,5 @@ pub use ports::{
     AccountQuery, BrokerInfo, Capabilities, DailyContext, MarketDataSource, OrderGateway,
     OrderJournal, Quotes, SecretStore, StateRepository, Strategy,
 };
-pub use position::{Fill, Holding, Position};
+pub use position::{Fill, Holding, Position, ReconcileOutcome};
 pub use settlement::settle;

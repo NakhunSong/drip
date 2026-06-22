@@ -39,7 +39,7 @@ driving adapters (composition roots) — the only crates that know every concret
 | `drip-domain` | Pure model + ports. No I/O, no runtime. | `Money`, `Price`, `Shares`, `Position`, `Holding`, `OrderIntent`, `settle()`, `risk::vet()`, and the port traits (incl. `OrderGateway`, `OrderJournal`). |
 | `drip-strategies` | Built-in strategies + registry (OCP seam). | `InfiniteBuying`, `StrategyRegistry`. |
 | `drip-brokers` | Broker adapters. | `KisBroker`, `TossBroker`, `PaperBroker`. |
-| `drip-app` | Use cases orchestrating ports (shared by CLI + web). | `Backtest`, `BacktestReport`, `account_snapshot`, `dry_run`, `run_backtest`, `place_orders`, `TickView`. |
+| `drip-app` | Use cases orchestrating ports (shared by CLI + web). | `Backtest`, `BacktestReport`, `account_snapshot`, `dry_run`, `run_backtest`, `place_orders`, `reconcile`, `TickView`. |
 | `drip-infra` | Filesystem/sqlite/logging adapters. | `AppConfig`, `FileSecretStore`, `SqliteStateRepository`, `CsvMarketData`. |
 | `drip-cli` | CLI + composition root (binary `drip`). | `main`, command handlers. |
 | `drip-web` | Read-only axum dashboard (`drip web`); a driving adapter over the use cases. | `serve`, HTTP handlers. |
@@ -49,8 +49,9 @@ driving adapters (composition roots) — the only crates that know every concret
 - **`Strategy`** — `decide(&DailyContext) -> Vec<OrderIntent>`. Pure and deterministic; the
   primary extension point.
 - **Broker ports, segregated (ISP):** `BrokerInfo` (id + capabilities), `Quotes`,
-  `AccountQuery`, `OrderGateway`. An adapter implements only what it supports — `KisBroker`
-  and `PaperBroker` implement `OrderGateway` (M2.1); `TossBroker` does not.
+  `AccountQuery` (holdings, balance, and `fills_since` execution history for reconciliation),
+  `OrderGateway`. An adapter implements only what it supports — `KisBroker` and `PaperBroker`
+  implement `OrderGateway` (M2.1); `TossBroker` does not.
 - **`OrderJournal`** — at-most-once idempotency ledger for placed orders (sqlite).
 - **`MarketDataSource`**, **`StateRepository`**, **`SecretStore`** — infra ports.
 
@@ -105,6 +106,23 @@ sandbox). **Rationale:** going live is inherently a runtime capability; concentr
 in one use case means every driving adapter (CLI, web, future scheduler) inherits them, and the
 type system still blocks Toss.
 
+### ADR-8: Fill reconciliation advances the ledger via a per-day watermark (M2.2)
+**Context:** `drip tick` placed orders but never folded executions back into the `Position`, so
+the tranche counter `T` did not auto-advance between days.
+**Decision:** `AccountQuery::fills_since` is implemented for KIS (overseas `inquire-ccnl`); a
+pure `Position::reconcile(fills, today)` applies only fills on **completed days not yet
+reconciled** (`reconciled_through < date < today`), then advances the `reconciled_through`
+watermark stored on the `Position`. `place_orders` runs it *before* deciding (persisting only on
+`--execute`; a preview reconciles in-memory so it never mutates stored state); `drip reconcile`
+exposes it standalone. **Rationale:** the watermark is idempotent by construction (a re-run, or
+a day's not-yet-final fills, never double-counts) and needs no per-execution id from the broker
+— exact for drip's day orders (LOC / day-limit), where a completed day's fills are final. A
+per-order/partial-fill ledger is deferred to streaming (intraday) strategies. Reconcile is
+read-only at the broker, so it runs without `--live`; folding it into `place_orders` means every
+driving adapter inherits a fresh ledger — no placement on a stale `T`. Under-counting a fill
+would make the strategy over-buy, so every drop path (truncated pages, a malformed row) is an
+explicit error, never a silent skip.
+
 ## Data flow: a backtest
 
 1. CLI loads the position config and builds the strategy via `StrategyRegistry`.
@@ -113,20 +131,34 @@ type system still blocks Toss.
    `Position::apply_fill` → detect cycle completion → mark to market.
 4. Returns a `BacktestReport` (equity curve, CAGR, MDD, cycles).
 
-## Data flow: `drip tick` (live order placement, M2.1)
+## Data flow: `drip tick` (live order placement)
 
 1. CLI resolves the position + KIS broker (`connect`) and gets its `OrderGateway` via
    `as_order_gateway()` (Toss → `None` → a clean error).
-2. `place_orders` (drip-app) gates a real account behind `--live`, loads the persisted
-   `Position`, fetches a quote, and runs `strategy.decide`.
+2. `place_orders` (drip-app) gates a real account behind `--live`, then **reconciles** settled
+   fills into the ledger (see below), loads the persisted `Position`, fetches a quote, and runs
+   `strategy.decide` on the now-current state.
 3. Every intent is `risk::vet`-ed against the position's anchor; one failure aborts the tick.
 4. For each intent (only when `--execute`): reserve an `OrderJournal` key → `gateway.place` →
    record the broker order id. Re-running the same day skips reserved keys (at-most-once).
 5. KIS maps `LimitOnClose` → `ORD_DVSN 34` (real) or `00` (모의, which rejects LOC); prices are
    rounded to the US $0.01 tick before sending.
 
-> M2.1 places orders only — it does **not** yet reconcile fills back into the ledger, so `T`
-> does not auto-advance between days. Reconciliation lands in M2.2 (see the engine sketch).
+## Data flow: fill reconciliation (`drip reconcile`, also the first step of `tick`)
+
+1. `reconcile` (drip-app) loads the `Position` and calls `AccountQuery::fills_since(ticker,
+   since)`, where `since` is the position's `reconciled_through` watermark (or a 90-day floor on
+   the first run).
+2. The KIS adapter queries overseas execution history (`inquire-ccnl`, paginated), mapping each
+   filled row to a `Fill` in chronological order.
+3. `Position::reconcile` applies only fills dated **after the watermark and before today**
+   (completed days), grouped per day through the shared `apply_day` rule — advancing `T`,
+   banking completed cycles, and moving the watermark. It is idempotent: a re-run applies
+   nothing new.
+4. The advanced `Position` is persisted **only when committing** — `drip reconcile` and
+   `drip tick --execute` save it; a `tick` preview reconciles in-memory and decides on it
+   without writing (like `dry-run`). A broker without execution history (Toss) yields a note
+   and leaves the ledger untouched, rather than failing.
 
 ## Milestone boundaries
 
@@ -134,7 +166,10 @@ type system still blocks Toss.
   read-only web dashboard.
 - **M2.1 (done):** live KIS `OrderGateway` + `drip tick` (risk guard, at-most-once journal,
   dry-run/`--live` gating). Toss stays read-only (no 모의 sandbox).
-- **M2.2+:** fill reconciliation (advance the ledger from executions), the scheduler /
-  `drip run` daemon (US open/close), Rhai user strategies, WebSocket quotes, OS-keychain
-  secrets, rate-limiting, notifications. See the [M2 engine sketch](./docs/M2-engine-sketch.md)
-  for the unified always-on/scheduled design.
+- **M2.2 (done):** fill reconciliation — `drip reconcile` + `AccountQuery::fills_since` (KIS
+  `inquire-ccnl`) fold executions into the ledger so `T` auto-advances and cycles bank;
+  `drip tick` reconciles before deciding.
+- **M2+ (next):** the scheduler / `drip run` daemon (US open/close), an ET `MarketCalendar`
+  (ET-date idempotency), Rhai user strategies, WebSocket quotes, OS-keychain secrets,
+  rate-limiting, notifications. See the [M2 engine sketch](./docs/M2-engine-sketch.md) for the
+  unified always-on/scheduled design.

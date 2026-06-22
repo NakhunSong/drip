@@ -194,9 +194,9 @@ impl AccountQuery for TossBroker {
         Ok(Money::new(crate::http::parse_decimal(cash)?))
     }
 
-    async fn fills_since(&self, _since: time::Date) -> Result<Vec<Fill>> {
+    async fn fills_since(&self, _ticker: &Ticker, _since: time::Date) -> Result<Vec<Fill>> {
         Err(DomainError::Unsupported(
-            "Toss execution history is not implemented in M1".into(),
+            "Toss execution history is not implemented (Toss stays read-only)".into(),
         ))
     }
 }
