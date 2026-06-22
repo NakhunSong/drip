@@ -6,12 +6,14 @@
 //! enforced by the `drip tick` use case rather than by the absence of the trait. Endpoints
 //! follow the official `koreainvestment/open-trading-api` reference. M2.2 adds the overseas
 //! execution-history endpoint (`inquire-ccnl`) as [`AccountQuery::fills_since`], which feeds
-//! fill reconciliation. Realtime (WebSocket) quotes and order cancellation are later
-//! enhancements; quote rate-limiting (~20 req/s real, ~5 req/s paper) arrives with the engine.
+//! fill reconciliation. Every request is spaced by a per-environment [`RateLimiter`] to stay
+//! under KIS's per-second cap (모의 is strict — it returns `EGW00201` "초당 거래건수 초과"
+//! otherwise, which broke multi-call commands like `tick`). Realtime (WebSocket) quotes and
+//! order cancellation are later enhancements.
 
 use crate::http::{
-    TokenCache, broker_err, parse_decimal, parse_price_opt, parse_shares, parse_yyyymmdd,
-    today_utc, yyyymmdd,
+    RateLimiter, TokenCache, broker_err, parse_decimal, parse_price_opt, parse_shares,
+    parse_yyyymmdd, today_utc, yyyymmdd,
 };
 use async_trait::async_trait;
 use drip_domain::{
@@ -20,6 +22,7 @@ use drip_domain::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// KIS environment: real trading vs the paper-trading (VTS) server.
@@ -115,17 +118,25 @@ pub struct KisBroker {
     base: String,
     client: reqwest::Client,
     tokens: TokenCache,
+    limiter: Arc<RateLimiter>,
 }
 
 impl KisBroker {
     pub fn new(config: KisConfig) -> Result<KisBroker> {
         let base = config.environment.base_url().to_string();
         let client = reqwest::Client::builder().build().map_err(broker_err)?;
+        // KIS throttles per second; 모의 strictly (≈1/s), 실전 ≈20/s. Space every request under
+        // the limit so multi-call commands (tick / account) never trip EGW00201.
+        let interval = match config.environment {
+            KisEnv::Paper => Duration::from_millis(1100),
+            KisEnv::Real => Duration::from_millis(60),
+        };
         Ok(KisBroker {
             config,
             base,
             client,
             tokens: TokenCache::new(),
+            limiter: Arc::new(RateLimiter::new(interval)),
         })
     }
 
@@ -134,8 +145,10 @@ impl KisBroker {
         let app_key = self.config.app_key.clone();
         let app_secret = self.config.app_secret.clone();
         let client = self.client.clone();
+        let limiter = self.limiter.clone();
         self.tokens
             .get_or_refresh(move || async move {
+                limiter.acquire().await;
                 let body = json!({
                     "grant_type": "client_credentials",
                     "appkey": app_key,
@@ -162,6 +175,7 @@ impl KisBroker {
 
     async fn fetch_balance(&self) -> Result<KisBalanceResp> {
         let token = self.token().await?;
+        self.limiter.acquire().await;
         let body: KisBalanceResp = self
             .client
             .get(format!(
@@ -235,6 +249,7 @@ impl BrokerInfo for KisBroker {
 impl Quotes for KisBroker {
     async fn quote(&self, ticker: &Ticker) -> Result<Quote> {
         let token = self.token().await?;
+        self.limiter.acquire().await;
         let body: KisQuoteResp = self
             .client
             .get(format!(
@@ -320,6 +335,7 @@ impl AccountQuery for KisBroker {
         let mut fills = Vec::new();
         let (mut fk, mut nk, mut tr_cont) = (String::new(), String::new(), String::new());
         for _ in 0..MAX_CCNL_PAGES {
+            self.limiter.acquire().await;
             let resp = self
                 .client
                 .get(format!(
@@ -435,6 +451,7 @@ impl OrderGateway for KisBroker {
             "ORD_DVSN": ord_dvsn,
         });
         // Only the order summary is logged — never the auth headers or secrets.
+        self.limiter.acquire().await;
         let resp: KisOrderResp = self
             .client
             .post(format!(
@@ -613,6 +630,7 @@ mod tests {
             base,
             client: reqwest::Client::new(),
             tokens: TokenCache::new(),
+            limiter: Arc::new(RateLimiter::new(Duration::ZERO)),
         }
     }
 
@@ -625,6 +643,7 @@ mod tests {
             base,
             client: reqwest::Client::new(),
             tokens: TokenCache::new(),
+            limiter: Arc::new(RateLimiter::new(Duration::ZERO)),
         }
     }
 

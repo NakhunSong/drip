@@ -38,7 +38,7 @@ driving adapters (composition roots) — the only crates that know every concret
 |---|---|---|
 | `drip-domain` | Pure model + ports. No I/O, no runtime. | `Money`, `Price`, `Shares`, `Position`, `Holding`, `OrderIntent`, `settle()`, `risk::vet()`, and the port traits (incl. `OrderGateway`, `OrderJournal`). |
 | `drip-strategies` | Built-in strategies + registry (OCP seam). | `InfiniteBuying`, `StrategyRegistry`. |
-| `drip-brokers` | Broker adapters. | `KisBroker`, `TossBroker`, `PaperBroker`. |
+| `drip-brokers` | Broker adapters; KIS requests are throttled to the broker's per-second rate limit. | `KisBroker`, `TossBroker`, `PaperBroker`. |
 | `drip-app` | Use cases orchestrating ports (shared by CLI + web). | `Backtest`, `BacktestReport`, `account_snapshot`, `dry_run`, `run_backtest`, `place_orders`, `reconcile`, `TickView`. |
 | `drip-infra` | Filesystem/sqlite/logging adapters. | `AppConfig`, `FileSecretStore`, `SqliteStateRepository`, `CsvMarketData`. |
 | `drip-cli` | CLI + composition root (binary `drip`). | `main`, command handlers. |

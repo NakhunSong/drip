@@ -59,6 +59,12 @@ Dependency rule: everything points inward to `drip-domain`. Order of crates:
 - Errors map to `DomainError` at adapter boundaries. The CLI uses `anyhow` at the top.
 - Secrets: `FileSecretStore` (`~/.drip/secrets.toml`, `0600`). Never log secret values.
   Secret keys use underscores (`kis_app_key`), never dots (dots are TOML nesting).
+- **KIS rate limit.** KIS throttles per second — 모의 strictly (~1/s; it returns `EGW00201`
+  "초당 거래건수 초과"), 실전 ~20/s. The KIS adapter spaces every request through a
+  per-environment `RateLimiter`; don't remove it, or multi-call commands (`tick` / `account`)
+  break on 모의. Scope: one `KisBroker` per connection, so `drip run` with **≥2 KIS positions**
+  still needs a shared broker/token (the per-broker limiters don't coordinate and the 2nd
+  token fetch hits KIS's 1/min token limit) — tracked in #12 / #15.
 
 ## Directory map
 
