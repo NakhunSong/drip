@@ -26,6 +26,12 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
   counter `T` auto-advances day to day and completed cost-averaging cycles are banked. Read-only
   at the broker (it places no orders), idempotent (only fills on completed days not yet
   reconciled are applied — a re-run never double-counts).
+- **`drip run` — the scheduler daemon.** Runs every configured position on a daily schedule
+  (US trading days only, with NYSE holidays observed), placing each through the same guarded path
+  as `drip tick`. Preview by default; `--execute` places and `--live` allows a real account. A
+  position whose scheduled time has already passed when the daemon starts is caught up
+  immediately (idempotently, only within the trading window); one position's failure is logged
+  and never stops the others; SIGINT/SIGTERM stops it cleanly between fires.
 
 ### Changed
 
@@ -37,10 +43,12 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
 - **`drip tick` now reconciles settled fills before deciding**, so today's tranche is computed
   from an up-to-date ledger rather than a stale one. A preview reconciles in-memory (no state
   write — like `dry-run`); `--execute` and the standalone `drip reconcile` persist the advance.
+- **The idempotency key and reconcile boundary now use the US Eastern trading date, not UTC.**
+  An Eastern session runs into the next UTC day, so a UTC key flipped after the close and risked
+  a double-place on an after-hours rerun; keying on the Eastern date (DST-aware) is stable.
 
-> **Limitations.** Idempotency and the reconcile boundary use the **UTC** date, so run
-> `drip tick` / `drip reconcile` once per trading day during US market hours (a proper ET
-> trading calendar arrives with `MarketCalendar`). Reconciliation is per **completed day**
-> (a day's fills are applied once that day is past), which is exact for drip's day orders
-> (LOC / day-limit) but not intended for intraday partial-fill precision. Toss order placement
-> is not supported.
+> **Limitations.** Reconciliation is per **completed day** (a day's fills are applied once that
+> day is past), which is exact for drip's day orders (LOC / day-limit) but not intended for
+> intraday partial-fill precision. The scheduler fires on a daily cadence only — realtime
+> triggers (on tick / on price-cross) arrive with the M3 WebSocket feed. Toss order placement is
+> not supported (read-only positions are skipped by `drip run`).

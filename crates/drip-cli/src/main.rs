@@ -9,8 +9,8 @@ use drip_app::{
     AccountView, DryRunView, ReconcileView, TickPorts, TickStatus, TickView, account_snapshot,
     dry_run, fetch_quote, list_positions, place_orders, reconcile, run_backtest,
 };
-use drip_brokers::connect;
-use drip_domain::{StateRepository, Ticker};
+use drip_brokers::{LiveBroker, connect};
+use drip_domain::{Position, Schedule, StateRepository, Strategy, Ticker, Trigger};
 use drip_infra::{
     AppConfig, CsvMarketData, FileSecretStore, PositionConfig, SqliteStateRepository, parse_date,
 };
@@ -19,6 +19,8 @@ use rust_decimal::Decimal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use time::Date;
+
+mod engine;
 
 #[derive(Parser)]
 #[command(
@@ -87,6 +89,16 @@ enum Command {
     Reconcile {
         #[arg(long)]
         name: String,
+    },
+    /// Run the scheduler daemon: fire every configured position on its schedule, on US trading
+    /// days. Dry-run by default; `--execute` places orders, `--live` allows a real account.
+    Run {
+        /// Actually place orders on each fire. Omit for a preview daemon that sends nothing.
+        #[arg(long)]
+        execute: bool,
+        /// Required to place against a KIS *real* (not 모의) account.
+        #[arg(long)]
+        live: bool,
     },
     /// Show persisted positions.
     Status,
@@ -197,6 +209,9 @@ async fn main() -> Result<()> {
         } => cmd_tick(&name, execute, live, &secrets, &config_path, state_path).await?,
         Command::Reconcile { name } => {
             cmd_reconcile(&name, &secrets, &config_path, state_path).await?
+        }
+        Command::Run { execute, live } => {
+            cmd_run(execute, live, &secrets, &config_path, state_path).await?
         }
         Command::Status => cmd_status(state_path).await?,
         Command::Web { addr } => drip_web::serve(addr).await?,
@@ -380,7 +395,10 @@ async fn cmd_tick(
     let registry = StrategyRegistry::with_builtins();
     let strategy = registry.build(&position.strategy, &position.strategy_params())?;
     let repo = SqliteStateRepository::open(state_path)?;
-    let today = time::OffsetDateTime::now_utc().date();
+    // drip's trading date is the US Eastern session date, so the at-most-once order key stays
+    // stable across an after-hours rerun (issue #3) — a UTC date would flip after the Eastern
+    // close and risk a double-place.
+    let today = drip_domain::calendar::us_eastern_date(time::OffsetDateTime::now_utc());
     let ports = TickPorts {
         quotes: live_broker.as_quotes(),
         gateway,
@@ -413,9 +431,114 @@ async fn cmd_reconcile(
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
     let live = connect(&position.broker, secrets)?;
     let repo = SqliteStateRepository::open(state_path)?;
-    let today = time::OffsetDateTime::now_utc().date();
+    // US Eastern session date (issue #3): the reconcile boundary "completed days < today" must
+    // use the exchange's date, matching the Eastern `ord_dt` the broker reports.
+    let today = drip_domain::calendar::us_eastern_date(time::OffsetDateTime::now_utc());
     let view = reconcile(live.as_account(), &repo, position.to_position()?, today).await?;
     print_reconcile(name, &view);
+    Ok(())
+}
+
+/// One scheduled position the daemon drives: its broker, strategy, and seed template. The
+/// broker and strategy are resolved once at startup so each fire just builds ports and places.
+struct EngineJob {
+    name: String,
+    broker: LiveBroker,
+    strategy: Box<dyn Strategy>,
+    template: Position,
+}
+
+async fn cmd_run(
+    execute: bool,
+    live: bool,
+    secrets: &FileSecretStore,
+    config_path: &Path,
+    state_path: PathBuf,
+) -> Result<()> {
+    let config = AppConfig::load(config_path)?;
+    if config.positions.is_empty() {
+        return Err(anyhow!(
+            "no positions configured — add one with `drip strategy add`"
+        ));
+    }
+    let repo = SqliteStateRepository::open(state_path)?;
+    let registry = StrategyRegistry::with_builtins();
+
+    // Resolve every position's broker + strategy up front, so a misconfiguration fails before
+    // the daemon starts rather than at the first fire. `schedules[i]` pairs with `jobs[i]`.
+    let mut jobs: Vec<EngineJob> = Vec::new();
+    let mut schedules: Vec<Schedule> = Vec::new();
+    for pc in &config.positions {
+        let broker = connect(&pc.broker, secrets)?;
+        if broker.as_order_gateway().is_none() {
+            // A read-only broker (e.g. Toss) can't place — skip it rather than blocking the
+            // whole daemon, so it still runs every position that can trade.
+            tracing::warn!(
+                "skipping position '{}': broker '{}' cannot place orders (KIS only)",
+                pc.name,
+                pc.broker
+            );
+            continue;
+        }
+        let strategy = registry.build(&pc.strategy, &pc.strategy_params())?;
+        let schedule = strategy
+            .triggers()
+            .into_iter()
+            .map(|Trigger::Schedule(s)| s)
+            .next()
+            .unwrap_or_else(Schedule::daily_before_open);
+        schedules.push(schedule);
+        jobs.push(EngineJob {
+            name: pc.name.clone(),
+            broker,
+            strategy,
+            template: pc.to_position()?,
+        });
+    }
+
+    if jobs.is_empty() {
+        return Err(anyhow!(
+            "no configured position can place orders — `drip run` needs a KIS position"
+        ));
+    }
+
+    tracing::info!(
+        "drip run: scheduling {} position(s) (execute={execute}, live={live}). Ctrl-C to stop.",
+        jobs.len()
+    );
+
+    engine::run(
+        &schedules,
+        async |i, now| {
+            let job = &jobs[i];
+            let gateway = job
+                .broker
+                .as_order_gateway()
+                .expect("order placement was verified at startup");
+            let ports = TickPorts {
+                quotes: job.broker.as_quotes(),
+                gateway,
+                account: job.broker.as_account(),
+                repo: &repo,
+                journal: &repo,
+            };
+            let today = drip_domain::calendar::us_eastern_date(now);
+            let view = place_orders(
+                &ports,
+                job.template.clone(),
+                job.strategy.as_ref(),
+                execute,
+                live,
+                today,
+            )
+            .await?;
+            print_tick(&job.name, &view);
+            Ok(())
+        },
+        time::OffsetDateTime::now_utc,
+        engine::shutdown_signal(),
+    )
+    .await;
     Ok(())
 }
 

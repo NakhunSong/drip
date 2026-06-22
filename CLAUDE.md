@@ -48,6 +48,14 @@ Dependency rule: everything points inward to `drip-domain`. Order of crates:
   `--execute`); never decide on a stale `T`. A fill must never be silently dropped (under-count
   → over-buy): every drop path is an explicit error.
   `fills_since` returns fills in chronological order (`apply_day` needs it).
+- **Trading calendar & scheduler (M2.3)** — `drip_domain::calendar` is the single source of the
+  US **Eastern** trading date (DST-aware) and NYSE holidays; the CLI, the scheduler, and the KIS
+  adapter all key off it (a market calendar is market knowledge, not a broker's). The idempotency
+  key and the reconcile boundary use the Eastern date, not UTC, so an after-hours rerun never
+  double-places. `drip run` (a drip-cli driving adapter) fires each position through
+  `place_orders` on its `Schedule`, on trading days only; the scheduling logic
+  (`next_fire`/`is_due`) is pure domain and the engine loop is thin async glue. Don't add a
+  live-trading path outside `place_orders`.
 - Errors map to `DomainError` at adapter boundaries. The CLI uses `anyhow` at the top.
 - Secrets: `FileSecretStore` (`~/.drip/secrets.toml`, `0600`). Never log secret values.
   Secret keys use underscores (`kis_app_key`), never dots (dots are TOML nesting).
@@ -82,12 +90,15 @@ docs/                   # M2 engine design sketch
   (`AccountQuery::fills_since(ticker, since)`) fold executions into the ledger so `T`
   auto-advances and cycles bank; `drip tick` reconciles before deciding. Idempotent per
   completed-day watermark (`Position.reconciled_through`).
-- **Still out of scope (M2+):** US-session scheduler / `drip run` daemon, WebSocket quotes,
+- **M2.3 (done):** ET trading-date idempotency + the `drip run` scheduler daemon. The
+  idempotency key and reconcile boundary use the **US Eastern** trading date
+  (`drip_domain::calendar`, DST-aware) so an after-hours rerun never double-places — issue #3.
+  `drip run` fires every configured position through `place_orders` on a daily `Schedule`, on
+  NYSE trading days, with per-position error isolation, trading-window catch-up, and graceful
+  shutdown — issue #4. `drip tick` stays the one-shot path.
+- **Still out of scope (M3+):** WebSocket quotes / realtime triggers (`OnTick`/`OnPriceCross`),
   Rhai strategies, OS-keychain secrets, rate-limiting, notifications, Toss order placement (no
-  모의 sandbox). Idempotency and the reconcile boundary use the **UTC** date, so run
-  `tick`/`reconcile` once per day during US hours (proper ET trading-calendar lands with a
-  future `MarketCalendar`). Any further live-trading change is a production-safety change —
-  surface it.
+  모의 sandbox). Any further live-trading change is a production-safety change — surface it.
 
 ## Definition of done
 

@@ -13,6 +13,7 @@ use crate::market::{Bar, BrokerId, MarketSnapshot, OrderId, Quote, Ticker};
 use crate::money::Money;
 use crate::order::OrderIntent;
 use crate::position::{Fill, Holding, Position};
+use crate::schedule::{Schedule, Trigger};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::Date;
@@ -33,6 +34,12 @@ pub trait Strategy: Send + Sync {
     fn name(&self) -> &str;
     /// Decide today's orders. MUST be deterministic for a given context.
     fn decide(&self, ctx: &DailyContext<'_>) -> Vec<OrderIntent>;
+    /// When the engine should call [`decide`](Strategy::decide). The default is a single daily
+    /// schedule before the US open, which suits batch strategies like infinite-buying;
+    /// streaming strategies override this once realtime triggers land (M3).
+    fn triggers(&self) -> Vec<Trigger> {
+        vec![Trigger::Schedule(Schedule::daily_before_open())]
+    }
 }
 
 /// Optional capabilities a broker adapter may support. The engine reads these to degrade
