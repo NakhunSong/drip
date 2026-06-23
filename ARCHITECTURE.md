@@ -168,8 +168,9 @@ and web pass the drip home, tests pass `None`), so `drip-brokers` gains no depen
 `drip-infra`. **Rationale:** disk is the only shared state between one-shot processes; injecting
 the path keeps filesystem-layout knowledge in the composition root and the adapter testable with a
 temp dir. Multi-position `drip run` works for free — positions fire sequentially, so the first
-writes the token and the rest read it. The per-*second* `RateLimiter` remains in-memory per
-process (#17).
+writes the token and the rest read it. The per-*second* `RateLimiter` shares its last-request
+timestamp on disk the same way (#17), so back-to-back commands coordinate across processes too;
+only truly-parallel launches race the shared file (best-effort, benign on 모의).
 
 ## Data flow: a backtest
 

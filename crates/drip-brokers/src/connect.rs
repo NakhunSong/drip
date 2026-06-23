@@ -40,12 +40,13 @@ impl LiveBroker {
     }
 }
 
-/// Build a live broker by name (`kis` | `toss`) from stored secrets. `token_cache_dir` (the drip
-/// home) is where KIS persists its OAuth token across processes; `None` keeps it in-memory only.
+/// Build a live broker by name (`kis` | `toss`) from stored secrets. `cache_dir` (the drip home)
+/// is where KIS persists its OAuth token and rate-limit timestamp across processes; `None` keeps
+/// them in-memory only.
 pub fn connect(
     broker: &str,
     secrets: &dyn SecretStore,
-    token_cache_dir: Option<&Path>,
+    cache_dir: Option<&Path>,
 ) -> Result<LiveBroker> {
     match broker {
         "kis" => {
@@ -66,7 +67,7 @@ pub fn connect(
                 product_code: require(secrets, "kis_product_code")?,
                 exchange: parse_exchange(&require(secrets, "kis_exchange")?)?,
             };
-            Ok(LiveBroker::Kis(KisBroker::new(config, token_cache_dir)?))
+            Ok(LiveBroker::Kis(KisBroker::new(config, cache_dir)?))
         }
         "toss" => {
             let account_seq = require(secrets, "toss_account_seq")?.parse().map_err(|e| {
