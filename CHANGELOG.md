@@ -53,14 +53,19 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
   command within the same second, exceeding KIS's per-second limit — which 모의 enforces strictly
   (it rejects the burst with `EGW00201` "초당 거래건수 초과", wrapped in an HTTP 500). So
   `drip tick` / `drip run` failed on the quote after reconciling, and `drip account` failed to
-  read the balance. Every KIS request is now spaced under the broker's per-second limit, so
-  multi-call commands run cleanly.
+  read the balance. Every KIS request is now spaced under the broker's per-second limit, so a
+  single command's multiple calls run cleanly (back-to-back commands too — see below).
 - **Back-to-back KIS commands no longer hit a token 403.** Each `drip` command is a separate
   process, and each was re-issuing a KIS OAuth token; KIS allows ~1 token/min per app key, so
   commands run in quick succession got `403` on the token endpoint — and `drip run` with two or
   more KIS positions tripped the same limit at the daily fire. The token (valid ~24h) is now
   cached on disk (`~/.drip/token-kis-*.json`, `0600`), so it is issued at most once per day
   across every command and daemon position.
+- **Back-to-back KIS commands no longer trip the per-second limit either.** The request spacing
+  is now also shared on disk (`~/.drip/ratelimit-kis-*.json`, `0600`), so commands run in quick
+  succession — `drip account` then `drip quote`, or a script chaining ticks — stay under KIS's
+  per-second cap across separate processes, not just within one command. Commands may briefly
+  pause (≈1s on 모의) to respect the limit.
 
 > **Limitations.** Reconciliation is per **completed day** (a day's fills are applied once that
 > day is past), which is exact for drip's day orders (LOC / day-limit) but not intended for

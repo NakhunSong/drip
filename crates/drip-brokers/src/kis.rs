@@ -8,14 +8,15 @@
 //! execution-history endpoint (`inquire-ccnl`) as [`AccountQuery::fills_since`], which feeds
 //! fill reconciliation. Every request is spaced by a per-environment [`RateLimiter`] to stay
 //! under KIS's per-second cap (모의 is strict — it returns `EGW00201` "초당 거래건수 초과"
-//! otherwise, which broke multi-call commands like `tick`). The OAuth token is cached on disk
-//! (an L2 [`TokenStore`]) so it survives across `drip` processes — KIS issues ~1 token/min per
-//! app key, so without persistence back-to-back commands (and multi-position `drip run`) hit a
-//! 403. Realtime (WebSocket) quotes and order cancellation are later enhancements.
+//! otherwise, which broke multi-call commands like `tick`); its last-request time is shared on
+//! disk so the spacing holds across separate `drip` processes too (#17). The OAuth token is
+//! likewise cached on disk (an L2 [`TokenStore`]) so it survives across processes — KIS issues
+//! ~1 token/min per app key, so without it back-to-back commands (and multi-position `drip run`)
+//! hit a 403. Realtime (WebSocket) quotes and order cancellation are later enhancements.
 
 use crate::http::{
-    RateLimiter, TokenCache, TokenStore, broker_err, parse_decimal, parse_price_opt, parse_shares,
-    parse_yyyymmdd, today_utc, yyyymmdd,
+    RateLimitStore, RateLimiter, TokenCache, TokenStore, broker_err, parse_decimal,
+    parse_price_opt, parse_shares, parse_yyyymmdd, today_utc, yyyymmdd,
 };
 use async_trait::async_trait;
 use drip_domain::{
@@ -124,10 +125,11 @@ pub struct KisBroker {
     limiter: Arc<RateLimiter>,
 }
 
-/// Filename for a KIS instance's persisted token: environment plus a hash of the app key, so
-/// 모의/실전 and rotated keys never reuse each other's token. (The hash only discriminates the
-/// file; if it changes across toolchains the old file is just orphaned → one extra issuance.)
-fn token_cache_filename(config: &KisConfig) -> String {
+/// Filename for a KIS instance's per-`kind` cache file (`kind` = `"token"` | `"ratelimit"`):
+/// environment plus a hash of the app key, so 모의/실전 and rotated keys never reuse each other's
+/// file. (The hash only discriminates the file; if it changes across toolchains the old file is
+/// just orphaned.)
+fn kis_cache_filename(config: &KisConfig, kind: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     config.app_key.hash(&mut hasher);
@@ -135,13 +137,13 @@ fn token_cache_filename(config: &KisConfig) -> String {
         KisEnv::Paper => "paper",
         KisEnv::Real => "real",
     };
-    format!("token-kis-{env}-{:016x}.json", hasher.finish())
+    format!("{kind}-kis-{env}-{:016x}.json", hasher.finish())
 }
 
 impl KisBroker {
-    /// Build a KIS adapter. `token_cache_dir` (the drip home) enables the on-disk L2 token cache;
-    /// `None` keeps the token cache in-memory only (tests).
-    pub fn new(config: KisConfig, token_cache_dir: Option<&Path>) -> Result<KisBroker> {
+    /// Build a KIS adapter. `cache_dir` (the drip home) enables the on-disk caches for the OAuth
+    /// token and the cross-process rate-limit timestamp; `None` keeps both in-memory only (tests).
+    pub fn new(config: KisConfig, cache_dir: Option<&Path>) -> Result<KisBroker> {
         let base = config.environment.base_url().to_string();
         let client = reqwest::Client::builder().build().map_err(broker_err)?;
         // KIS throttles per second; 모의 strictly (≈1/s), 실전 ≈20/s. Space every request under
@@ -150,20 +152,26 @@ impl KisBroker {
             KisEnv::Paper => Duration::from_millis(1100),
             KisEnv::Real => Duration::from_millis(60),
         };
-        // L2 token cache under the drip home so the OAuth token survives across processes
-        // (KIS issues ~1 token/min per app key). Memory-only when no dir is provided.
-        let tokens = match token_cache_dir {
-            Some(dir) => {
-                TokenCache::with_store(TokenStore::new(dir.join(token_cache_filename(&config))))
-            }
-            None => TokenCache::new(),
+        // Disk-backed caches under the drip home so the token and the rate-limit timestamp survive
+        // across processes (KIS issues ~1 token/min, and throttles per second, per app key).
+        // Memory-only when no dir is provided.
+        let (tokens, limiter_store) = match cache_dir {
+            Some(dir) => (
+                TokenCache::with_store(TokenStore::new(
+                    dir.join(kis_cache_filename(&config, "token")),
+                )),
+                Some(RateLimitStore::new(
+                    dir.join(kis_cache_filename(&config, "ratelimit")),
+                )),
+            ),
+            None => (TokenCache::new(), None),
         };
         Ok(KisBroker {
             config,
             base,
             client,
             tokens,
-            limiter: Arc::new(RateLimiter::new(interval)),
+            limiter: Arc::new(RateLimiter::new(interval, limiter_store)),
         })
     }
 
@@ -657,7 +665,7 @@ mod tests {
             base,
             client: reqwest::Client::new(),
             tokens: TokenCache::new(),
-            limiter: Arc::new(RateLimiter::new(Duration::ZERO)),
+            limiter: Arc::new(RateLimiter::new(Duration::ZERO, None)),
         }
     }
 
@@ -670,7 +678,7 @@ mod tests {
             base,
             client: reqwest::Client::new(),
             tokens: TokenCache::new(),
-            limiter: Arc::new(RateLimiter::new(Duration::ZERO)),
+            limiter: Arc::new(RateLimiter::new(Duration::ZERO, None)),
         }
     }
 

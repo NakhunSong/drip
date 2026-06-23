@@ -6,7 +6,7 @@ use drip_domain::{DomainError, Price, Result, Shares};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -26,6 +26,12 @@ pub(crate) fn today_utc() -> time::Date {
 /// absolute-expiry math reads the clock in one place.
 fn now_unix() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// Current Unix time in milliseconds. Sub-second precision is needed for the rate limiter's
+/// cross-process spacing (the 실전 interval is 60ms).
+fn now_millis() -> i64 {
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
 }
 
 pub(crate) fn parse_decimal(raw: &str) -> Result<Decimal> {
@@ -183,88 +189,140 @@ impl TokenStore {
         Some((persisted.token, Duration::from_secs(remaining)))
     }
 
-    /// Persist the token with an absolute expiry, best-effort. Writes a per-process `0600` temp
-    /// file and atomically renames it over the target, so a concurrent reader never sees a torn
-    /// file. Errors are logged and swallowed — a failed write just means the next process
-    /// re-fetches.
+    /// Persist the token with an absolute expiry, best-effort. Errors are logged and swallowed —
+    /// a failed write just means the next process re-fetches.
     fn save(&self, token: &str, ttl: Duration) {
         let expires_at_unix = now_unix() + ttl.as_secs() as i64;
         let persisted = PersistedToken {
             token: token.to_string(),
             expires_at_unix,
         };
-        if let Err(e) = self.write_atomic(&persisted) {
+        let json = match serde_json::to_string(&persisted) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!("could not serialize KIS token: {e}");
+                return;
+            }
+        };
+        if let Err(e) = write_atomic_0600(&self.path, json.as_bytes()) {
             tracing::warn!(
                 "could not persist KIS token to {}: {e}",
                 self.path.display()
             );
         }
     }
+}
 
-    fn write_atomic(&self, persisted: &PersistedToken) -> std::io::Result<()> {
-        use std::io::Write;
-        let json = serde_json::to_string(persisted).map_err(std::io::Error::other)?;
-        // Unique-per-write temp name (pid + a process-global counter), so even concurrent writers
-        // in one process — e.g. two drip-web requests cold-starting separate KisBrokers against the
-        // same token file — never clobber each other's temp before the atomic rename.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-        let tmp = self.path.with_extension(format!(
-            "{}.{}.tmp",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut file = opts.open(&tmp)?;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
-        }
+/// Write `bytes` to `path` atomically with mode `0600`: a unique-per-write temp file (pid + a
+/// process-global counter, so concurrent writers never collide) is created `0600`, written,
+/// fsync'd, and renamed over `path`. Shared by [`TokenStore`] and [`RateLimitStore`].
+fn write_atomic_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
-        std::fs::rename(&tmp, &self.path)
+        let mut file = opts.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// On-disk record of the last KIS request time (Unix millis).
+#[derive(Serialize, Deserialize)]
+struct PersistedRateLimit {
+    last_request_ms: i64,
+}
+
+/// L2 for the rate limiter: a single `0600` JSON file holding the last KIS request time, so the
+/// per-second spacing holds across separate `drip` processes (each command is its own process).
+/// Best-effort — a missing/corrupt file or a failed write silently degrades to per-process spacing.
+#[derive(Debug)]
+pub(crate) struct RateLimitStore {
+    path: PathBuf,
+}
+
+impl RateLimitStore {
+    pub(crate) fn new(path: PathBuf) -> RateLimitStore {
+        RateLimitStore { path }
+    }
+
+    /// The last recorded request time (Unix millis), or `None` if the file is absent/unreadable.
+    fn load(&self) -> Option<i64> {
+        let raw = std::fs::read_to_string(&self.path).ok()?;
+        let persisted: PersistedRateLimit = serde_json::from_str(&raw).ok()?;
+        Some(persisted.last_request_ms)
+    }
+
+    /// Record the last-request time. Best-effort and **silent** on failure — this writes on every
+    /// KIS request, so logging per call would spam; degrading to per-process spacing is acceptable.
+    fn save(&self, last_request_ms: i64) {
+        if let Ok(json) = serde_json::to_string(&PersistedRateLimit { last_request_ms }) {
+            let _ = write_atomic_0600(&self.path, json.as_bytes());
+        }
     }
 }
 
-/// A simple async rate limiter that spaces successive [`acquire`](RateLimiter::acquire) calls by
-/// at least `min_interval`. KIS throttles per second — 모의 strictly (≈1/s; it returns
-/// `EGW00201` "초당 거래건수 초과" otherwise), 실전 ≈20/s — so every KIS request acquires this
-/// first. The lock is held across the wait, which serializes callers and guarantees the spacing
-/// even under concurrency.
+/// An async rate limiter that spaces successive [`acquire`](RateLimiter::acquire) calls by at
+/// least `min_interval`. KIS throttles per second — 모의 strictly (≈1/s; it returns `EGW00201`
+/// "초당 거래건수 초과" otherwise), 실전 ≈20/s — so every KIS request acquires this first.
+/// Spacing is **exact within a process** (the held lock serializes callers) and **best-effort
+/// across processes** via a shared on-disk timestamp ([`RateLimitStore`]): each `drip` command is
+/// its own process, so without it two commands launched within a second would not coordinate (#17).
 #[derive(Debug)]
 pub(crate) struct RateLimiter {
     min_interval: Duration,
-    last: Mutex<Option<Instant>>,
+    last_ms: Mutex<Option<i64>>,
+    store: Option<RateLimitStore>,
 }
 
 impl RateLimiter {
-    pub(crate) fn new(min_interval: Duration) -> RateLimiter {
+    pub(crate) fn new(min_interval: Duration, store: Option<RateLimitStore>) -> RateLimiter {
         RateLimiter {
             min_interval,
-            last: Mutex::new(None),
+            last_ms: Mutex::new(None),
+            store,
         }
     }
 
-    /// Wait until at least `min_interval` has elapsed since the previous acquire, then record the
-    /// new time. A zero interval makes this a no-op (used by tests so they don't sleep).
+    /// Wait until at least `min_interval` has elapsed since the previous acquire — in this process
+    /// or, via the store, any other — then record the new time. A zero interval is a no-op (tests).
     pub(crate) async fn acquire(&self) {
-        let mut last = self.last.lock().await;
-        if let Some(prev) = *last {
-            let elapsed = prev.elapsed();
-            if elapsed < self.min_interval {
-                tokio::time::sleep(self.min_interval - elapsed).await;
+        let mut last = self.last_ms.lock().await;
+        let disk = self.store.as_ref().and_then(|store| store.load());
+        let prev = [*last, disk].into_iter().flatten().max();
+        if let Some(prev) = prev {
+            let interval_ms = self.min_interval.as_millis() as i64;
+            let elapsed = now_millis() - prev;
+            if elapsed < 0 {
+                // Wall clock moved backward (e.g. NTP); be conservative and wait a full interval.
+                tokio::time::sleep(self.min_interval).await;
+            } else if elapsed < interval_ms {
+                tokio::time::sleep(Duration::from_millis((interval_ms - elapsed) as u64)).await;
             }
         }
-        *last = Some(Instant::now());
+        let fired = now_millis();
+        *last = Some(fired);
+        if let Some(store) = &self.store {
+            store.save(fired);
+        }
     }
 }
 
@@ -336,7 +394,9 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_spaces_successive_acquires() {
-        let limiter = RateLimiter::new(Duration::from_millis(40));
+        // 50ms interval with a 40ms assertion: margin for millisecond quantization, since the
+        // limiter now measures wall-clock millis rather than a sub-ms `Instant`.
+        let limiter = RateLimiter::new(Duration::from_millis(50), None);
         let start = Instant::now();
         limiter.acquire().await; // first is immediate (no prior)
         limiter.acquire().await; // second waits out the interval
@@ -344,6 +404,35 @@ mod tests {
             start.elapsed() >= Duration::from_millis(40),
             "two acquires should be spaced by at least the interval"
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_spaces_across_processes_via_the_store() {
+        // Deterministic: assert the *recorded* timestamps are spaced by the interval, rather than
+        // measuring a wall-clock sleep (which flakes if the scheduler delays the second acquire
+        // past the interval). The second limiter is a fresh instance whose only shared state is
+        // the file, so its spacing can only come from the first's on-disk timestamp.
+        let path = temp_path("ratelimit");
+        let _ = std::fs::remove_file(&path);
+        let interval = Duration::from_millis(50);
+        RateLimiter::new(interval, Some(RateLimitStore::new(path.clone())))
+            .acquire()
+            .await;
+        let first = RateLimitStore::new(path.clone())
+            .load()
+            .expect("first acquire records a timestamp");
+        RateLimiter::new(interval, Some(RateLimitStore::new(path.clone())))
+            .acquire()
+            .await;
+        let second = RateLimitStore::new(path.clone())
+            .load()
+            .expect("second acquire records a timestamp");
+        assert!(
+            second - first >= interval.as_millis() as i64,
+            "the second acquire must record at least one interval past the first (got {}ms)",
+            second - first
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 
     // A zero interval (used by the test brokers so the suite never sleeps) is exercised

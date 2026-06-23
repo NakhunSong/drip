@@ -61,13 +61,13 @@ Dependency rule: everything points inward to `drip-domain`. Order of crates:
   Secret keys use underscores (`kis_app_key`), never dots (dots are TOML nesting).
 - **KIS rate limit & token.** KIS throttles per second — 모의 strictly (~1/s; it returns
   `EGW00201` "초당 거래건수 초과"), 실전 ~20/s — and issues ~1 OAuth token/min per app key. The
-  KIS adapter spaces every request through a per-environment in-memory `RateLimiter` (don't
-  remove it, or multi-call commands break on 모의), and caches the token on disk
-  (`~/.drip/token-kis-*.json`, `0600`, #12) so it is issued at most once/day across processes.
-  Multi-position `drip run` works: positions fire **sequentially**, so the first writes the token
-  and the rest read it (one issuance, no 1/min 403) and their per-broker limiters never collide.
-  Caveat: the `RateLimiter` is per-process, so two CLI commands launched <1s apart can still trip
-  the per-second limit across processes (#17).
+  KIS adapter spaces every request through a per-environment `RateLimiter` (don't remove it, or
+  multi-call commands break on 모의), and caches both the OAuth token and the limiter's
+  last-request time on disk (`~/.drip/{token,ratelimit}-kis-*.json`, `0600`, #12 / #17) so they
+  coordinate across processes: the token is issued at most once/day, and the per-second spacing
+  holds across back-to-back commands, not just within one process. Multi-position `drip run`
+  works (positions fire **sequentially** → the first writes the token, the rest read it). Only
+  truly-parallel launches (`a & b &`) can still race the shared timestamp — best-effort, benign.
 
 ## Directory map
 
