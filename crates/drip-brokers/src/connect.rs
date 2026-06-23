@@ -7,6 +7,7 @@
 
 use crate::{KisBroker, KisConfig, KisEnv, KisExchange, TossBroker, TossConfig};
 use drip_domain::{AccountQuery, DomainError, OrderGateway, Quotes, Result, SecretStore};
+use std::path::Path;
 
 /// A connected live broker, dispatching the read-only ports to the concrete adapter.
 pub enum LiveBroker {
@@ -39,8 +40,13 @@ impl LiveBroker {
     }
 }
 
-/// Build a live broker by name (`kis` | `toss`) from stored secrets.
-pub fn connect(broker: &str, secrets: &dyn SecretStore) -> Result<LiveBroker> {
+/// Build a live broker by name (`kis` | `toss`) from stored secrets. `token_cache_dir` (the drip
+/// home) is where KIS persists its OAuth token across processes; `None` keeps it in-memory only.
+pub fn connect(
+    broker: &str,
+    secrets: &dyn SecretStore,
+    token_cache_dir: Option<&Path>,
+) -> Result<LiveBroker> {
     match broker {
         "kis" => {
             let environment = match require(secrets, "kis_env")?.as_str() {
@@ -60,7 +66,7 @@ pub fn connect(broker: &str, secrets: &dyn SecretStore) -> Result<LiveBroker> {
                 product_code: require(secrets, "kis_product_code")?,
                 exchange: parse_exchange(&require(secrets, "kis_exchange")?)?,
             };
-            Ok(LiveBroker::Kis(KisBroker::new(config)?))
+            Ok(LiveBroker::Kis(KisBroker::new(config, token_cache_dir)?))
         }
         "toss" => {
             let account_seq = require(secrets, "toss_account_seq")?.parse().map_err(|e| {
@@ -122,7 +128,7 @@ mod tests {
     #[test]
     fn connect_kis_requires_all_secrets() {
         let secrets = MapSecrets::default();
-        assert!(connect("kis", &secrets).is_err()); // nothing stored yet
+        assert!(connect("kis", &secrets, None).is_err()); // nothing stored yet
         for (k, v) in [
             ("kis_env", "paper"),
             ("kis_app_key", "k"),
@@ -134,13 +140,13 @@ mod tests {
             secrets.set(k, v).unwrap();
         }
         assert!(matches!(
-            connect("kis", &secrets).unwrap(),
+            connect("kis", &secrets, None).unwrap(),
             LiveBroker::Kis(_)
         ));
     }
 
     #[test]
     fn unknown_broker_is_an_error() {
-        assert!(connect("nope", &MapSecrets::default()).is_err());
+        assert!(connect("nope", &MapSecrets::default(), None).is_err());
     }
 }

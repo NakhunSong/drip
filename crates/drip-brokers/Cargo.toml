@@ -18,6 +18,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 time = { version = "0.3.49", features = ["macros", "std"] }
 tokio = { version = "1.52.3", features = ["sync", "time"] }
+tracing = "0.1.44"
 
 [dev-dependencies]
 rust_decimal_macros = "1.40.0"
