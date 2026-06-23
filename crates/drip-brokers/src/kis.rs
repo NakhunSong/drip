@@ -345,10 +345,14 @@ impl AccountQuery for KisBroker {
     }
 
     async fn balance(&self) -> Result<Money> {
-        // inquire-balance has no clean deposit figure; report total holdings evaluation
-        // amount. Spendable cash uses inquire-present-balance (a later enhancement).
+        // inquire-balance has no clean deposit figure; report the total overseas-stock evaluation
+        // amount — the *value of holdings*, not spendable cash (that needs inquire-present-balance,
+        // a later enhancement). 모의, and any account with no overseas holdings, omit the field
+        // entirely, so an empty value means zero (nothing to evaluate), not a failure.
         let body = self.fetch_balance().await?;
-        Ok(Money::new(parse_decimal(&body.output2.ovrs_stck_evlu_amt)?))
+        let raw = body.output2.ovrs_stck_evlu_amt.trim();
+        let amount = if raw.is_empty() { "0" } else { raw };
+        Ok(Money::new(parse_decimal(amount)?))
     }
 
     async fn fills_since(&self, ticker: &Ticker, since: time::Date) -> Result<Vec<Fill>> {
@@ -738,6 +742,29 @@ mod tests {
         assert_eq!(holdings[0].shares, Shares::new(10));
         assert_eq!(holdings[0].avg_price, Price::new(dec!(55.5)));
         assert_eq!(broker.balance().await.unwrap(), Money::new(dec!(600.00)));
+    }
+
+    #[tokio::test]
+    async fn balance_is_zero_when_the_eval_field_is_absent() {
+        // A 모의 (or any holdings-free) account returns rt_cd "0" but omits `ovrs_stck_evlu_amt` —
+        // there is nothing to evaluate. `balance()` must read that as 0, not fail (#14).
+        let server = MockServer::start().await;
+        mock_token(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/uapi/overseas-stock/v1/trading/inquire-balance"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rt_cd": "0",
+                "msg_cd": "70070000",
+                "msg1": "모의투자 조회할 내역(자료)이 없습니다.",
+                "output1": [],
+                "output2": {"ovrs_rlzt_pfls_amt": "0.00000", "tot_evlu_pfls_amt": "0.00000000"}
+            })))
+            .mount(&server)
+            .await;
+
+        let broker = broker(server.uri());
+        assert!(broker.holdings().await.unwrap().is_empty());
+        assert_eq!(broker.balance().await.unwrap(), Money::new(dec!(0)));
     }
 
     #[tokio::test]
