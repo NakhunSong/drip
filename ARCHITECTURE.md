@@ -38,7 +38,7 @@ driving adapters (composition roots) — the only crates that know every concret
 |---|---|---|
 | `drip-domain` | Pure model + ports. No I/O, no runtime. | `Money`, `Price`, `Shares`, `Position`, `Holding`, `OrderIntent`, `settle()`, `risk::vet()`, and the port traits (incl. `OrderGateway`, `OrderJournal`). |
 | `drip-strategies` | Built-in strategies + registry (OCP seam). | `InfiniteBuying`, `StrategyRegistry`. |
-| `drip-brokers` | Broker adapters; KIS requests are throttled to the broker's per-second rate limit. | `KisBroker`, `TossBroker`, `PaperBroker`. |
+| `drip-brokers` | Broker adapters; KIS requests are throttled to the broker's per-second rate limit and its OAuth token is cached on disk across processes (ADR-11). | `KisBroker`, `TossBroker`, `PaperBroker`. |
 | `drip-app` | Use cases orchestrating ports (shared by CLI + web). | `Backtest`, `BacktestReport`, `account_snapshot`, `dry_run`, `run_backtest`, `place_orders`, `reconcile`, `TickView`. |
 | `drip-infra` | Filesystem/sqlite/logging adapters. | `AppConfig`, `FileSecretStore`, `SqliteStateRepository`, `CsvMarketData`. |
 | `drip-cli` | CLI + composition root (binary `drip`). | `main`, command handlers. |
@@ -153,6 +153,23 @@ streaming sources arrive; the daemon's safety (per-position error isolation, tra
 catch-up backed by the idempotent journal, graceful shutdown) is glue around already-proven
 guards. A market calendar gives every `OnTick`/`OnPriceCross` strategy a future seam without a
 core change.
+
+### ADR-11: The KIS OAuth token is cached on disk, with the cache path injected (M2.3+)
+**Context:** Each `drip` CLI command is a separate process, so an in-memory token cache re-issues
+a KIS OAuth token every command. KIS allows ~1 token/min per app key, so back-to-back commands —
+and `drip run` with multiple KIS positions — got `403` on the token endpoint.
+**Decision:** `TokenCache` is two-tier — L1 in-memory plus an optional L2 on-disk `TokenStore`
+(a `0600` JSON file under the drip home, keyed by environment + app-key hash). A token is valid
+~24h, so it is issued at most once per day across processes. The disk record stores an
+**absolute** expiry (the in-memory `Instant` is process-monotonic and unserializable) and `load()`
+guards the expiry before the unsigned cast, so a stale file is a miss, not a wrapped huge TTL. The
+cache **directory is injected from the composition root** (`connect(.., token_cache_dir)`; the CLI
+and web pass the drip home, tests pass `None`), so `drip-brokers` gains no dependency on
+`drip-infra`. **Rationale:** disk is the only shared state between one-shot processes; injecting
+the path keeps filesystem-layout knowledge in the composition root and the adapter testable with a
+temp dir. Multi-position `drip run` works for free — positions fire sequentially, so the first
+writes the token and the rest read it. The per-*second* `RateLimiter` remains in-memory per
+process (#17).
 
 ## Data flow: a backtest
 

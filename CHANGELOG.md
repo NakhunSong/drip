@@ -55,6 +55,12 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
   `drip tick` / `drip run` failed on the quote after reconciling, and `drip account` failed to
   read the balance. Every KIS request is now spaced under the broker's per-second limit, so
   multi-call commands run cleanly.
+- **Back-to-back KIS commands no longer hit a token 403.** Each `drip` command is a separate
+  process, and each was re-issuing a KIS OAuth token; KIS allows ~1 token/min per app key, so
+  commands run in quick succession got `403` on the token endpoint — and `drip run` with two or
+  more KIS positions tripped the same limit at the daily fire. The token (valid ~24h) is now
+  cached on disk (`~/.drip/token-kis-*.json`, `0600`), so it is issued at most once per day
+  across every command and daemon position.
 
 > **Limitations.** Reconciliation is per **completed day** (a day's fills are applied once that
 > day is past), which is exact for drip's day orders (LOC / day-limit) but not intended for

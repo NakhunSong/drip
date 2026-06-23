@@ -70,7 +70,7 @@ async fn api_quote(
     Query(q): Query<QuoteQuery>,
 ) -> Result<Json<Quote>, ApiError> {
     let secrets = FileSecretStore::new(s.secrets_path.clone());
-    let live = connect(&q.broker, &secrets)?;
+    let live = connect(&q.broker, &secrets, s.secrets_path.parent())?;
     Ok(Json(
         drip_app::fetch_quote(live.as_quotes(), &Ticker::new(q.ticker)).await?,
     ))
@@ -86,7 +86,7 @@ async fn api_account(
     Query(q): Query<BrokerQuery>,
 ) -> Result<Json<AccountView>, ApiError> {
     let secrets = FileSecretStore::new(s.secrets_path.clone());
-    let live = connect(&q.broker, &secrets)?;
+    let live = connect(&q.broker, &secrets, s.secrets_path.parent())?;
     Ok(Json(drip_app::account_snapshot(live.as_account()).await?))
 }
 

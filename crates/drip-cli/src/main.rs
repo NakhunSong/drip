@@ -263,7 +263,7 @@ async fn cmd_keys(action: KeysAction, secrets: &FileSecretStore) -> Result<()> {
         }
     };
     println!("Stored {broker} credentials.");
-    match connect(broker, secrets) {
+    match connect(broker, secrets, Some(drip_infra::drip_home()?.as_path())) {
         Ok(live) => match fetch_quote(live.as_quotes(), &Ticker::new("AAPL")).await {
             Ok(quote) => println!("Validated: AAPL = {}", quote.price),
             Err(e) => println!("Warning: credential probe failed: {e}"),
@@ -274,13 +274,13 @@ async fn cmd_keys(action: KeysAction, secrets: &FileSecretStore) -> Result<()> {
 }
 
 async fn cmd_account(broker: &str, secrets: &FileSecretStore) -> Result<()> {
-    let live = connect(broker, secrets)?;
+    let live = connect(broker, secrets, Some(drip_infra::drip_home()?.as_path()))?;
     print_account(&account_snapshot(live.as_account()).await?);
     Ok(())
 }
 
 async fn cmd_quote(ticker: &str, broker: &str, secrets: &FileSecretStore) -> Result<()> {
-    let live = connect(broker, secrets)?;
+    let live = connect(broker, secrets, Some(drip_infra::drip_home()?.as_path()))?;
     let quote = fetch_quote(live.as_quotes(), &Ticker::new(ticker)).await?;
     println!(
         "{} {} = {} (as of {})",
@@ -356,7 +356,11 @@ async fn cmd_dry_run(
     let position = config
         .find(name)
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
-    let live = connect(&position.broker, secrets)?;
+    let live = connect(
+        &position.broker,
+        secrets,
+        Some(drip_infra::drip_home()?.as_path()),
+    )?;
     let registry = StrategyRegistry::with_builtins();
     let strategy = registry.build(&position.strategy, &position.strategy_params())?;
     let repo = SqliteStateRepository::open(state_path)?;
@@ -383,7 +387,11 @@ async fn cmd_tick(
     let position = config
         .find(name)
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
-    let live_broker = connect(&position.broker, secrets)?;
+    let live_broker = connect(
+        &position.broker,
+        secrets,
+        Some(drip_infra::drip_home()?.as_path()),
+    )?;
     let gateway = live_broker.as_order_gateway().ok_or_else(|| {
         anyhow!(
             "broker '{}' does not support order placement (KIS only in M2.1)",
@@ -429,7 +437,11 @@ async fn cmd_reconcile(
     let position = config
         .find(name)
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
-    let live = connect(&position.broker, secrets)?;
+    let live = connect(
+        &position.broker,
+        secrets,
+        Some(drip_infra::drip_home()?.as_path()),
+    )?;
     let repo = SqliteStateRepository::open(state_path)?;
     // US Eastern session date (issue #3): the reconcile boundary "completed days < today" must
     // use the exchange's date, matching the Eastern `ord_dt` the broker reports.
@@ -469,7 +481,11 @@ async fn cmd_run(
     let mut jobs: Vec<EngineJob> = Vec::new();
     let mut schedules: Vec<Schedule> = Vec::new();
     for pc in &config.positions {
-        let broker = connect(&pc.broker, secrets)?;
+        let broker = connect(
+            &pc.broker,
+            secrets,
+            Some(drip_infra::drip_home()?.as_path()),
+        )?;
         if broker.as_order_gateway().is_none() {
             // A read-only broker (e.g. Toss) can't place — skip it rather than blocking the
             // whole daemon, so it still runs every position that can trade.

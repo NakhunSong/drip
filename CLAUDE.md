@@ -59,12 +59,15 @@ Dependency rule: everything points inward to `drip-domain`. Order of crates:
 - Errors map to `DomainError` at adapter boundaries. The CLI uses `anyhow` at the top.
 - Secrets: `FileSecretStore` (`~/.drip/secrets.toml`, `0600`). Never log secret values.
   Secret keys use underscores (`kis_app_key`), never dots (dots are TOML nesting).
-- **KIS rate limit.** KIS throttles per second — 모의 strictly (~1/s; it returns `EGW00201`
-  "초당 거래건수 초과"), 실전 ~20/s. The KIS adapter spaces every request through a
-  per-environment `RateLimiter`; don't remove it, or multi-call commands (`tick` / `account`)
-  break on 모의. Scope: one `KisBroker` per connection, so `drip run` with **≥2 KIS positions**
-  still needs a shared broker/token (the per-broker limiters don't coordinate and the 2nd
-  token fetch hits KIS's 1/min token limit) — tracked in #12 / #15.
+- **KIS rate limit & token.** KIS throttles per second — 모의 strictly (~1/s; it returns
+  `EGW00201` "초당 거래건수 초과"), 실전 ~20/s — and issues ~1 OAuth token/min per app key. The
+  KIS adapter spaces every request through a per-environment in-memory `RateLimiter` (don't
+  remove it, or multi-call commands break on 모의), and caches the token on disk
+  (`~/.drip/token-kis-*.json`, `0600`, #12) so it is issued at most once/day across processes.
+  Multi-position `drip run` works: positions fire **sequentially**, so the first writes the token
+  and the rest read it (one issuance, no 1/min 403) and their per-broker limiters never collide.
+  Caveat: the `RateLimiter` is per-process, so two CLI commands launched <1s apart can still trip
+  the per-second limit across processes (#17).
 
 ## Directory map
 
