@@ -326,6 +326,40 @@ impl RateLimiter {
     }
 }
 
+/// Send a request with bounded retry on *transient* failures — an HTTP 5xx, or a connect/timeout
+/// error — acquiring `limiter` before each attempt and waiting `backoff_base * 2^(n-1)` between
+/// them. `build` is called per attempt to produce a fresh request (so it can be re-sent). A 4xx
+/// (e.g. the token 1/min 403) returns immediately; backoff would not clear it.
+///
+/// For **single-shot idempotent** reads only (a quote, a balance). NOT for a paginated read that
+/// accumulates across calls (`fills_since`): the reconcile path folds each fill without de-duping
+/// by execution id, so a re-returned page would be counted twice → over-buy. And never the order
+/// endpoint: KIS assigns its own order number with no client-supplied idempotency key, so a
+/// retried write could double-place.
+pub(crate) async fn send_with_retry(
+    limiter: &RateLimiter,
+    backoff_base: Duration,
+    build: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_error: Option<DomainError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        limiter.acquire().await;
+        match build().send().await {
+            Ok(resp) if resp.status().is_server_error() && attempt < MAX_ATTEMPTS => {
+                last_error = Some(broker_err(format!("KIS HTTP {}", resp.status())));
+            }
+            Ok(resp) => return resp.error_for_status().map_err(broker_err),
+            Err(e) if (e.is_timeout() || e.is_connect()) && attempt < MAX_ATTEMPTS => {
+                last_error = Some(broker_err(&e));
+            }
+            Err(e) => return Err(broker_err(e)),
+        }
+        tokio::time::sleep(backoff_base * (1 << (attempt - 1))).await;
+    }
+    Err(last_error.unwrap_or_else(|| broker_err("KIS request failed after retries")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,7 +16,7 @@
 
 use crate::http::{
     RateLimitStore, RateLimiter, TokenCache, TokenStore, broker_err, parse_decimal,
-    parse_price_opt, parse_shares, parse_yyyymmdd, today_utc, yyyymmdd,
+    parse_price_opt, parse_shares, parse_yyyymmdd, send_with_retry, today_utc, yyyymmdd,
 };
 use async_trait::async_trait;
 use drip_domain::{
@@ -123,6 +123,8 @@ pub struct KisBroker {
     client: reqwest::Client,
     tokens: TokenCache,
     limiter: Arc<RateLimiter>,
+    /// Base backoff between transient-5xx retries (exponential); zero in tests.
+    retry_backoff: Duration,
 }
 
 /// Filename for a KIS instance's per-`kind` cache file (`kind` = `"token"` | `"ratelimit"`):
@@ -172,6 +174,7 @@ impl KisBroker {
             client,
             tokens,
             limiter: Arc::new(RateLimiter::new(interval, limiter_store)),
+            retry_backoff: Duration::from_millis(250),
         })
     }
 
@@ -210,34 +213,30 @@ impl KisBroker {
 
     async fn fetch_balance(&self) -> Result<KisBalanceResp> {
         let token = self.token().await?;
-        self.limiter.acquire().await;
-        let body: KisBalanceResp = self
-            .client
-            .get(format!(
-                "{}/uapi/overseas-stock/v1/trading/inquire-balance",
-                self.base
-            ))
-            .header("authorization", format!("Bearer {token}"))
-            .header("appkey", &self.config.app_key)
-            .header("appsecret", &self.config.app_secret)
-            .header("tr_id", self.config.environment.balance_tr_id())
-            .header("custtype", "P")
-            .query(&[
-                ("CANO", self.config.cano.as_str()),
-                ("ACNT_PRDT_CD", self.config.product_code.as_str()),
-                ("OVRS_EXCG_CD", self.config.exchange.excg_code_4()),
-                ("TR_CRCY_CD", "USD"),
-                ("CTX_AREA_FK200", ""),
-                ("CTX_AREA_NK200", ""),
-            ])
-            .send()
-            .await
-            .map_err(broker_err)?
-            .error_for_status()
-            .map_err(broker_err)?
-            .json()
-            .await
-            .map_err(broker_err)?;
+        let body: KisBalanceResp = send_with_retry(&self.limiter, self.retry_backoff, || {
+            self.client
+                .get(format!(
+                    "{}/uapi/overseas-stock/v1/trading/inquire-balance",
+                    self.base
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .header("appkey", &self.config.app_key)
+                .header("appsecret", &self.config.app_secret)
+                .header("tr_id", self.config.environment.balance_tr_id())
+                .header("custtype", "P")
+                .query(&[
+                    ("CANO", self.config.cano.as_str()),
+                    ("ACNT_PRDT_CD", self.config.product_code.as_str()),
+                    ("OVRS_EXCG_CD", self.config.exchange.excg_code_4()),
+                    ("TR_CRCY_CD", "USD"),
+                    ("CTX_AREA_FK200", ""),
+                    ("CTX_AREA_NK200", ""),
+                ])
+        })
+        .await?
+        .json()
+        .await
+        .map_err(broker_err)?;
         if body.rt_cd != "0" {
             return Err(DomainError::Broker(format!(
                 "KIS balance rt_cd={} {}",
@@ -284,31 +283,27 @@ impl BrokerInfo for KisBroker {
 impl Quotes for KisBroker {
     async fn quote(&self, ticker: &Ticker) -> Result<Quote> {
         let token = self.token().await?;
-        self.limiter.acquire().await;
-        let body: KisQuoteResp = self
-            .client
-            .get(format!(
-                "{}/uapi/overseas-price/v1/quotations/price",
-                self.base
-            ))
-            .header("authorization", format!("Bearer {token}"))
-            .header("appkey", &self.config.app_key)
-            .header("appsecret", &self.config.app_secret)
-            .header("tr_id", "HHDFS00000300")
-            .header("custtype", "P")
-            .query(&[
-                ("AUTH", ""),
-                ("EXCD", self.config.exchange.quote_code()),
-                ("SYMB", ticker.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(broker_err)?
-            .error_for_status()
-            .map_err(broker_err)?
-            .json()
-            .await
-            .map_err(broker_err)?;
+        let body: KisQuoteResp = send_with_retry(&self.limiter, self.retry_backoff, || {
+            self.client
+                .get(format!(
+                    "{}/uapi/overseas-price/v1/quotations/price",
+                    self.base
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .header("appkey", &self.config.app_key)
+                .header("appsecret", &self.config.app_secret)
+                .header("tr_id", "HHDFS00000300")
+                .header("custtype", "P")
+                .query(&[
+                    ("AUTH", ""),
+                    ("EXCD", self.config.exchange.quote_code()),
+                    ("SYMB", ticker.as_str()),
+                ])
+        })
+        .await?
+        .json()
+        .await
+        .map_err(broker_err)?;
         if body.rt_cd != "0" {
             return Err(DomainError::Broker(format!(
                 "KIS quote rt_cd={} {}",
@@ -345,10 +340,14 @@ impl AccountQuery for KisBroker {
     }
 
     async fn balance(&self) -> Result<Money> {
-        // inquire-balance has no clean deposit figure; report total holdings evaluation
-        // amount. Spendable cash uses inquire-present-balance (a later enhancement).
+        // inquire-balance has no clean deposit figure; report the total overseas-stock evaluation
+        // amount — the *value of holdings*, not spendable cash (that needs inquire-present-balance,
+        // a later enhancement). 모의, and any account with no overseas holdings, omit the field
+        // entirely, so an empty value means zero (nothing to evaluate), not a failure.
         let body = self.fetch_balance().await?;
-        Ok(Money::new(parse_decimal(&body.output2.ovrs_stck_evlu_amt)?))
+        let raw = body.output2.ovrs_stck_evlu_amt.trim();
+        let amount = if raw.is_empty() { "0" } else { raw };
+        Ok(Money::new(parse_decimal(amount)?))
     }
 
     async fn fills_since(&self, ticker: &Ticker, since: time::Date) -> Result<Vec<Fill>> {
@@ -370,6 +369,11 @@ impl AccountQuery for KisBroker {
         let mut fills = Vec::new();
         let (mut fk, mut nk, mut tr_cont) = (String::new(), String::new(), String::new());
         for _ in 0..MAX_CCNL_PAGES {
+            // NOT wrapped in `send_with_retry`: this read accumulates fills across pages, and the
+            // reconcile path applies each fill without de-duping by execution id, so a re-returned
+            // page would be folded twice → over-counted fills → over-buy. A transient 5xx here
+            // aborts the tick instead (conservative — no placement on a stale ledger; the next
+            // fire retries). Single-shot reads (quote, balance) do retry.
             self.limiter.acquire().await;
             let resp = self
                 .client
@@ -666,6 +670,7 @@ mod tests {
             client: reqwest::Client::new(),
             tokens: TokenCache::new(),
             limiter: Arc::new(RateLimiter::new(Duration::ZERO, None)),
+            retry_backoff: Duration::ZERO,
         }
     }
 
@@ -679,6 +684,7 @@ mod tests {
             client: reqwest::Client::new(),
             tokens: TokenCache::new(),
             limiter: Arc::new(RateLimiter::new(Duration::ZERO, None)),
+            retry_backoff: Duration::ZERO,
         }
     }
 
@@ -714,6 +720,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quote_retries_a_transient_5xx_then_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // First price request 500s; the retry gets a good quote. Deterministic per-call responder
+        // (no mock-ordering assumptions). Test brokers use zero backoff, so this never sleeps.
+        struct FlakyThenOk(AtomicU32);
+        impl wiremock::Respond for FlakyThenOk {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"rt_cd": "0", "output": {"last": "123.45"}}))
+                }
+            }
+        }
+        let server = MockServer::start().await;
+        mock_token(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/uapi/overseas-price/v1/quotations/price"))
+            .respond_with(FlakyThenOk(AtomicU32::new(0)))
+            .mount(&server)
+            .await;
+
+        let quote = broker(server.uri())
+            .quote(&Ticker::new("TQQQ"))
+            .await
+            .unwrap();
+        assert_eq!(quote.price, Price::new(dec!(123.45)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn quote_gives_up_after_persistent_5xx() {
+        let server = MockServer::start().await;
+        mock_token(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/uapi/overseas-price/v1/quotations/price"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(3) // MAX_ATTEMPTS — verified when `server` drops
+            .mount(&server)
+            .await;
+
+        assert!(
+            broker(server.uri())
+                .quote(&Ticker::new("TQQQ"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn holdings_skip_zero_quantity_lots() {
         let server = MockServer::start().await;
         mock_token(&server).await;
@@ -738,6 +794,29 @@ mod tests {
         assert_eq!(holdings[0].shares, Shares::new(10));
         assert_eq!(holdings[0].avg_price, Price::new(dec!(55.5)));
         assert_eq!(broker.balance().await.unwrap(), Money::new(dec!(600.00)));
+    }
+
+    #[tokio::test]
+    async fn balance_is_zero_when_the_eval_field_is_absent() {
+        // A 모의 (or any holdings-free) account returns rt_cd "0" but omits `ovrs_stck_evlu_amt` —
+        // there is nothing to evaluate. `balance()` must read that as 0, not fail (#14).
+        let server = MockServer::start().await;
+        mock_token(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/uapi/overseas-stock/v1/trading/inquire-balance"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rt_cd": "0",
+                "msg_cd": "70070000",
+                "msg1": "모의투자 조회할 내역(자료)이 없습니다.",
+                "output1": [],
+                "output2": {"ovrs_rlzt_pfls_amt": "0.00000", "tot_evlu_pfls_amt": "0.00000000"}
+            })))
+            .mount(&server)
+            .await;
+
+        let broker = broker(server.uri());
+        assert!(broker.holdings().await.unwrap().is_empty());
+        assert_eq!(broker.balance().await.unwrap(), Money::new(dec!(0)));
     }
 
     #[tokio::test]
