@@ -9,10 +9,12 @@
 pub mod connect;
 mod http;
 pub mod kis;
+pub mod kis_domestic;
 pub mod paper;
 pub mod toss;
 
 pub use connect::{LiveBroker, connect, parse_exchange};
 pub use kis::{KisBroker, KisConfig, KisEnv, KisExchange};
+pub use kis_domestic::KisDomesticBroker;
 pub use paper::PaperBroker;
 pub use toss::{TossBroker, TossConfig};

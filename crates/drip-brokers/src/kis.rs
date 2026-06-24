@@ -36,7 +36,7 @@ pub enum KisEnv {
     Paper,
 }
 impl KisEnv {
-    fn base_url(self) -> &'static str {
+    pub(crate) fn base_url(self) -> &'static str {
         match self {
             KisEnv::Real => "https://openapi.koreainvestment.com:9443",
             KisEnv::Paper => "https://openapivts.koreainvestment.com:29443",
@@ -131,7 +131,7 @@ pub struct KisBroker {
 /// environment plus a hash of the app key, so 모의/실전 and rotated keys never reuse each other's
 /// file. (The hash only discriminates the file; if it changes across toolchains the old file is
 /// just orphaned.)
-fn kis_cache_filename(config: &KisConfig, kind: &str) -> String {
+pub(crate) fn kis_cache_filename(config: &KisConfig, kind: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     config.app_key.hash(&mut hasher);

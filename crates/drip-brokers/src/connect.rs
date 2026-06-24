@@ -5,13 +5,14 @@
 //! stored secrets. The returned [`LiveBroker`] exposes the read-only ports as trait
 //! objects so use cases can stay broker-agnostic.
 
-use crate::{KisBroker, KisConfig, KisEnv, KisExchange, TossBroker, TossConfig};
+use crate::{KisBroker, KisConfig, KisDomesticBroker, KisEnv, KisExchange, TossBroker, TossConfig};
 use drip_domain::{AccountQuery, DomainError, OrderGateway, Quotes, Result, SecretStore};
 use std::path::Path;
 
 /// A connected live broker, dispatching the read-only ports to the concrete adapter.
 pub enum LiveBroker {
     Kis(KisBroker),
+    KisDomestic(KisDomesticBroker),
     Toss(TossBroker),
 }
 
@@ -19,22 +20,25 @@ impl LiveBroker {
     pub fn as_quotes(&self) -> &dyn Quotes {
         match self {
             LiveBroker::Kis(b) => b,
+            LiveBroker::KisDomestic(b) => b,
             LiveBroker::Toss(b) => b,
         }
     }
     pub fn as_account(&self) -> &dyn AccountQuery {
         match self {
             LiveBroker::Kis(b) => b,
+            LiveBroker::KisDomestic(b) => b,
             LiveBroker::Toss(b) => b,
         }
     }
 
-    /// The order-placement port, if this broker supports it. KIS does (M2); Toss does not —
-    /// it has no paper sandbox, so live Toss placement is deferred to a later, separately
-    /// gated increment. Returning `None` keeps Toss read-only.
+    /// The order-placement port, if this broker supports it. Overseas KIS does (M2); the domestic
+    /// KIS adapter is read-only for now (placement is a later phase) and Toss has no paper sandbox,
+    /// so both return `None`.
     pub fn as_order_gateway(&self) -> Option<&dyn OrderGateway> {
         match self {
             LiveBroker::Kis(b) => Some(b),
+            LiveBroker::KisDomestic(_) => None,
             LiveBroker::Toss(_) => None,
         }
     }
@@ -49,26 +53,14 @@ pub fn connect(
     cache_dir: Option<&Path>,
 ) -> Result<LiveBroker> {
     match broker {
-        "kis" => {
-            let environment = match require(secrets, "kis_env")?.as_str() {
-                "real" => KisEnv::Real,
-                "paper" => KisEnv::Paper,
-                other => {
-                    return Err(DomainError::Config(format!(
-                        "kis_env must be real|paper, got '{other}'"
-                    )));
-                }
-            };
-            let config = KisConfig {
-                environment,
-                app_key: require(secrets, "kis_app_key")?,
-                app_secret: require(secrets, "kis_app_secret")?,
-                cano: require(secrets, "kis_cano")?,
-                product_code: require(secrets, "kis_product_code")?,
-                exchange: parse_exchange(&require(secrets, "kis_exchange")?)?,
-            };
-            Ok(LiveBroker::Kis(KisBroker::new(config, cache_dir)?))
-        }
+        "kis" => Ok(LiveBroker::Kis(KisBroker::new(
+            kis_config(secrets)?,
+            cache_dir,
+        )?)),
+        "kis-domestic" => Ok(LiveBroker::KisDomestic(KisDomesticBroker::new(
+            kis_config(secrets)?,
+            cache_dir,
+        )?)),
         "toss" => {
             let account_seq = require(secrets, "toss_account_seq")?.parse().map_err(|e| {
                 DomainError::Config(format!("toss_account_seq must be an integer: {e}"))
@@ -84,6 +76,28 @@ pub fn connect(
             "broker '{other}' has no live adapter (use kis|toss)"
         ))),
     }
+}
+
+/// Build a [`KisConfig`] from the stored `kis_*` secrets — shared by the overseas (`kis`) and
+/// domestic (`kis-domestic`) adapters, which use the same account and app key.
+fn kis_config(secrets: &dyn SecretStore) -> Result<KisConfig> {
+    let environment = match require(secrets, "kis_env")?.as_str() {
+        "real" => KisEnv::Real,
+        "paper" => KisEnv::Paper,
+        other => {
+            return Err(DomainError::Config(format!(
+                "kis_env must be real|paper, got '{other}'"
+            )));
+        }
+    };
+    Ok(KisConfig {
+        environment,
+        app_key: require(secrets, "kis_app_key")?,
+        app_secret: require(secrets, "kis_app_secret")?,
+        cano: require(secrets, "kis_cano")?,
+        product_code: require(secrets, "kis_product_code")?,
+        exchange: parse_exchange(&require(secrets, "kis_exchange")?)?,
+    })
 }
 
 /// Parse an exchange name into a [`KisExchange`].
