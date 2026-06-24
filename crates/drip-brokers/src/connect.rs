@@ -32,13 +32,12 @@ impl LiveBroker {
         }
     }
 
-    /// The order-placement port, if this broker supports it. Overseas KIS does (M2); the domestic
-    /// KIS adapter is read-only for now (placement is a later phase) and Toss has no paper sandbox,
-    /// so both return `None`.
+    /// The order-placement port, if this broker supports it. Both KIS adapters (overseas and
+    /// domestic) do; Toss has no paper sandbox, so it stays read-only and returns `None`.
     pub fn as_order_gateway(&self) -> Option<&dyn OrderGateway> {
         match self {
             LiveBroker::Kis(b) => Some(b),
-            LiveBroker::KisDomestic(_) => None,
+            LiveBroker::KisDomestic(b) => Some(b),
             LiveBroker::Toss(_) => None,
         }
     }

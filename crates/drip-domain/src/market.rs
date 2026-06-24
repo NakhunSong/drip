@@ -46,10 +46,13 @@ impl std::str::FromStr for BrokerId {
     fn from_str(s: &str) -> Result<BrokerId, DomainError> {
         match s {
             "kis" => Ok(BrokerId::Kis),
+            // The domestic KIS adapter is the same broker (and shares the journal id) as overseas
+            // KIS; the position's broker *string* ("kis-domestic") is what routes `connect` to it.
+            "kis-domestic" => Ok(BrokerId::Kis),
             "toss" => Ok(BrokerId::Toss),
             "paper" => Ok(BrokerId::Paper),
             other => Err(DomainError::Config(format!(
-                "unknown broker '{other}' (use kis|toss|paper)"
+                "unknown broker '{other}' (use kis|kis-domestic|toss|paper)"
             ))),
         }
     }

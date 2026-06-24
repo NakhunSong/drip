@@ -296,9 +296,8 @@ pub async fn place_orders(
         && intents.iter().any(|i| i.kind == OrderKind::LimitOnClose)
     {
         notes.push(
-            "KIS 모의(paper) accepts only limit orders; LOC legs are sent as plain day-limits \
-             at the leg's limit price (not a true LOC), so they may fill intraday, not at the \
-             close"
+            "KIS 모의(paper) has no true LOC: LOC legs are sent as plain day-limits at the \
+             leg's limit price, so they may fill intraday, not at the close"
                 .to_string(),
         );
     }

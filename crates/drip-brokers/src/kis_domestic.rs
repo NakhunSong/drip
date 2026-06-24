@@ -1,10 +1,12 @@
 //! 한국투자증권 (KIS) adapter — **domestic** Korean-stock quotes and balance.
 //!
-//! Read-only: quotes ([`Quotes`]) and account state ([`AccountQuery`]) only. It does **not**
-//! implement [`drip_domain::OrderGateway`], so there is no type-level path to place a domestic
-//! order yet — live domestic placement and execution history are a later phase. Endpoints follow
-//! the official `koreainvestment/open-trading-api` reference (`domestic_stock/inquire_price` and
-//! `inquire_balance`).
+//! Quotes ([`Quotes`]), account state ([`AccountQuery`]), and live order placement
+//! ([`drip_domain::OrderGateway`]). Domestic 모의 orders are placed as 지정가 (limit) at the leg's
+//! limit price, rounded to the KRX ETF tick — a 모의 placement path on a KRW-funded account
+//! (overseas USD orders can't be placed there). Real-account placement and execution-history
+//! reconciliation are a later phase (#22). Endpoints follow the official
+//! `koreainvestment/open-trading-api` reference
+//! (`domestic_stock/{inquire_price, inquire_balance, order_cash}`).
 //!
 //! The account, app key/secret, OAuth token, and per-second rate limiter are **shared with the
 //! overseas [`KisBroker`]**: same app key → same on-disk token and rate-limit files (the cache
@@ -19,9 +21,10 @@ use crate::http::{
 use crate::kis::{KisConfig, KisEnv, kis_cache_filename};
 use async_trait::async_trait;
 use drip_domain::{
-    AccountQuery, BrokerId, BrokerInfo, Capabilities, DomainError, Fill, Holding, Money, Quote,
-    Quotes, Result, Ticker,
+    AccountQuery, BrokerId, BrokerInfo, Capabilities, DomainError, Fill, Holding, Money,
+    OrderGateway, OrderId, OrderIntent, Quote, Quotes, Result, Side, Ticker,
 };
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
@@ -160,6 +163,16 @@ impl KisDomesticBroker {
         }
         Ok(body)
     }
+
+    /// Domestic cash-order `tr_id`, by side and environment (`T*` real, `V*` paper).
+    fn order_tr_id(&self, side: Side) -> &'static str {
+        match (self.config.environment, side) {
+            (KisEnv::Real, Side::Buy) => "TTTC0012U",
+            (KisEnv::Real, Side::Sell) => "TTTC0011U",
+            (KisEnv::Paper, Side::Buy) => "VTTC0012U",
+            (KisEnv::Paper, Side::Sell) => "VTTC0011U",
+        }
+    }
 }
 
 impl BrokerInfo for KisDomesticBroker {
@@ -170,7 +183,7 @@ impl BrokerInfo for KisDomesticBroker {
         Capabilities {
             realtime_quotes: false,
             paper_account: matches!(self.config.environment, KisEnv::Paper),
-            order_placement: false,
+            order_placement: true,
             overseas: false,
         }
     }
@@ -256,6 +269,101 @@ impl AccountQuery for KisDomesticBroker {
     }
 }
 
+/// Round a KRW limit price to the KRX **ETF** tick — 1원 below 2,000원, 5원 at/above (KRX 2023
+/// rule). drip's 무한매수법 targets leveraged ETFs (e.g. KODEX 레버리지), so the ETF tick is correct
+/// here; common stocks use a coarser per-band table (deferred to #22), and an off-tick price on a
+/// common stock would simply be rejected by KIS (fails loud, never silent).
+fn etf_tick_round(price: Decimal) -> Decimal {
+    let tick = if price < Decimal::from(2000) {
+        Decimal::ONE
+    } else {
+        Decimal::from(5)
+    };
+    (price / tick).round() * tick
+}
+
+#[async_trait]
+impl OrderGateway for KisDomesticBroker {
+    async fn place(&self, ticker: &Ticker, order: &OrderIntent) -> Result<OrderId> {
+        // Real-account placement waits for execution-history reconcile (#22): the domestic
+        // `fills_since` is still a stub, so without it `T` can't advance from fills and repeated
+        // real placement would over-buy. 모의 (a fresh ledger each test) is fine.
+        if matches!(self.config.environment, KisEnv::Real) {
+            return Err(DomainError::Unsupported(
+                "domestic real-account placement is not enabled yet — it waits for \
+                 execution-history reconcile (#22)"
+                    .into(),
+            ));
+        }
+        // The strategy's LOC legs are placed as 지정가 (limit, `ORD_DVSN` "00") at the leg's limit
+        // price, rounded to the KRX **ETF** tick (5원 ≥2,000원 / 1원 below — the 무한매수법 targets
+        // leveraged ETFs; common-stock tick bands are #22). KIS 모의 has no true LOC, so this is a
+        // day-limit at that price (the same degrade the overseas adapter makes), not close-only.
+        let token = self.token().await?;
+        let limit = order.limit.ok_or_else(|| {
+            DomainError::Broker("domestic placement requires a limit price".into())
+        })?;
+        let unit_price = etf_tick_round(limit.value());
+        let body = json!({
+            "CANO": self.config.cano,
+            "ACNT_PRDT_CD": self.config.product_code,
+            "PDNO": ticker.as_str(),
+            "ORD_DVSN": "00",
+            "ORD_QTY": order.shares.get().to_string(),
+            "ORD_UNPR": unit_price.normalize().to_string(),
+            "EXCG_ID_DVSN_CD": "KRX",
+        });
+        // Not wrapped in `send_with_retry`: an order is a write; KIS assigns its own order number
+        // with no client idempotency key, so a retried submission could double-place (see #20).
+        self.limiter.acquire().await;
+        let resp: KisOrderResp = self
+            .client
+            .post(format!(
+                "{}/uapi/domestic-stock/v1/trading/order-cash",
+                self.base
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .header("appkey", &self.config.app_key)
+            .header("appsecret", &self.config.app_secret)
+            .header("tr_id", self.order_tr_id(order.side))
+            .header("custtype", "P")
+            .json(&body)
+            .send()
+            .await
+            .map_err(broker_err)?
+            .error_for_status()
+            .map_err(broker_err)?
+            .json()
+            .await
+            .map_err(broker_err)?;
+        if resp.rt_cd != "0" {
+            return Err(DomainError::Broker(format!(
+                "KIS domestic order rt_cd={} {}",
+                resp.rt_cd, resp.msg1
+            )));
+        }
+        let odno = resp.output.odno.trim();
+        if odno.is_empty() {
+            return Err(DomainError::Broker(
+                "KIS order accepted but returned no order number".into(),
+            ));
+        }
+        let org = resp.output.krx_fwdg_ord_orgno.trim();
+        let number = if org.is_empty() {
+            odno.to_string()
+        } else {
+            format!("{org}/{odno}")
+        };
+        Ok(OrderId::new(number))
+    }
+
+    async fn cancel(&self, _id: &OrderId) -> Result<()> {
+        Err(DomainError::Unsupported(
+            "domestic KIS order cancellation is not implemented".into(),
+        ))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct KisToken {
     access_token: String,
@@ -309,13 +417,32 @@ struct KisHolding {
     pchs_avg_pric: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct KisOrderResp {
+    #[serde(default)]
+    rt_cd: String,
+    #[serde(default)]
+    msg1: String,
+    #[serde(default)]
+    output: KisOrderOutput,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KisOrderOutput {
+    // The order-cash response field casing isn't validated live yet; accept either case.
+    #[serde(default, alias = "ODNO")]
+    odno: String,
+    #[serde(default, alias = "KRX_FWDG_ORD_ORGNO")]
+    krx_fwdg_ord_orgno: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kis::KisExchange;
     use drip_domain::{Price, Shares};
     use rust_decimal_macros::dec;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn config() -> KisConfig {
@@ -436,5 +563,74 @@ mod tests {
         let broker = broker(server.uri());
         assert!(broker.holdings().await.unwrap().is_empty());
         assert_eq!(broker.balance().await.unwrap(), Money::new(dec!(0)));
+    }
+
+    #[tokio::test]
+    async fn place_sends_a_limit_order_rounded_to_the_etf_tick() {
+        let server = MockServer::start().await;
+        mock_token(&server).await;
+        // 지정가 (00); the 188,477.3 limit rounds to the 5원 ETF tick → 188,475.
+        Mock::given(method("POST"))
+            .and(path("/uapi/domestic-stock/v1/trading/order-cash"))
+            .and(body_partial_json(json!({
+                "PDNO": "122630",
+                "ORD_DVSN": "00",
+                "ORD_QTY": "1",
+                "ORD_UNPR": "188475",
+                "EXCG_ID_DVSN_CD": "KRX"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rt_cd": "0",
+                "msg1": "ok",
+                "output": {"KRX_FWDG_ORD_ORGNO": "00950", "ODNO": "0001234567"}
+            })))
+            .mount(&server)
+            .await;
+
+        let intent = OrderIntent::loc(
+            Side::Buy,
+            Shares::new(1),
+            Price::new(dec!(188477.3)).unwrap(),
+            "loc_low",
+        );
+        let id = broker(server.uri())
+            .place(&Ticker::new("122630"), &intent)
+            .await
+            .unwrap();
+        assert_eq!(id.as_str(), "00950/0001234567");
+    }
+
+    #[test]
+    fn etf_tick_round_is_5won_at_or_above_2000_and_1won_below() {
+        assert_eq!(etf_tick_round(dec!(188477.3)), dec!(188475)); // nearest 5원 tick (≥2,000)
+        assert_eq!(etf_tick_round(dec!(188478)), dec!(188480)); // nearest 5원 tick
+        assert_eq!(etf_tick_round(dec!(2002.5)), dec!(2000)); // exact half-tick → banker's (to even)
+        assert_eq!(etf_tick_round(dec!(2000)), dec!(2000)); // boundary → 5원 tick
+        assert_eq!(etf_tick_round(dec!(1999.6)), dec!(2000)); // <2,000 → nearest 1원
+        assert_eq!(etf_tick_round(dec!(1850.4)), dec!(1850)); // <2,000 → nearest 1원
+    }
+
+    #[tokio::test]
+    async fn place_refuses_a_real_account() {
+        // Domestic placement is 모의-only until execution-history reconcile (#22); a real account
+        // must be refused before any network call (no order is ever sent).
+        let broker = KisDomesticBroker {
+            config: KisConfig {
+                environment: KisEnv::Real,
+                ..config()
+            },
+            base: "http://unused.invalid".into(),
+            client: reqwest::Client::new(),
+            tokens: TokenCache::new(),
+            limiter: Arc::new(RateLimiter::new(Duration::ZERO, None)),
+            retry_backoff: Duration::ZERO,
+        };
+        let intent = OrderIntent::loc(
+            Side::Buy,
+            Shares::new(1),
+            Price::new(dec!(200000)).unwrap(),
+            "loc",
+        );
+        assert!(broker.place(&Ticker::new("122630"), &intent).await.is_err());
     }
 }
