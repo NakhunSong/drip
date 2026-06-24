@@ -1,12 +1,12 @@
-//! 한국투자증권 (KIS) adapter — **domestic** Korean-stock quotes and balance.
+//! 한국투자증권 (KIS) adapter — **domestic** Korean-stock quotes, balance, and orders.
 //!
 //! Quotes ([`Quotes`]), account state ([`AccountQuery`]), and live order placement
-//! ([`drip_domain::OrderGateway`]). Domestic 모의 orders are placed as 지정가 (limit) at the leg's
-//! limit price, rounded to the KRX ETF tick — a 모의 placement path on a KRW-funded account
-//! (overseas USD orders can't be placed there). Real-account placement and execution-history
-//! reconciliation are a later phase (#22). Endpoints follow the official
-//! `koreainvestment/open-trading-api` reference
-//! (`domestic_stock/{inquire_price, inquire_balance, order_cash}`).
+//! ([`drip_domain::OrderGateway`]) with execution-history reconcile via `inquire-daily-ccld`
+//! (#22 P2). Domestic 모의 orders are placed as 지정가 (limit) at the leg's limit price, rounded to
+//! the KRX ETF tick — a 모의 placement path on a KRW-funded account (overseas USD orders can't be
+//! placed there). A *real* domestic account stays fenced (a deliberate go-live step — #22).
+//! Endpoints follow the official `koreainvestment/open-trading-api` reference
+//! (`domestic_stock/{inquire_price, inquire_balance, order_cash, inquire_daily_ccld}`).
 //!
 //! The account, app key/secret, OAuth token, and per-second rate limiter are **shared with the
 //! overseas [`KisBroker`]**: same app key → same on-disk token and rate-limit files (the cache
@@ -413,14 +413,14 @@ fn etf_tick_round(price: Decimal) -> Decimal {
 #[async_trait]
 impl OrderGateway for KisDomesticBroker {
     async fn place(&self, ticker: &Ticker, order: &OrderIntent) -> Result<OrderId> {
-        // Real-account placement is fenced until the cross-day place→reconcile round-trip is
-        // verified live on 모의 (#22 P3). `fills_since` now advances `T` from fills (P2), but
-        // turning on real money is a production-safety step gated on that fresh evidence, not on
-        // reasoning. 모의 (a fresh ledger each test) is fine.
+        // 모의 domestic placement is enabled (#22 P3). A REAL domestic account stays fenced: it is
+        // a deliberate go-live step, taken only after the cross-day reconcile is confirmed live on
+        // 모의 and a real placement is verified — real money on a new adapter is not bundled into
+        // enabling 모의. Lifting this fence is a separate production-safety decision.
         if matches!(self.config.environment, KisEnv::Real) {
             return Err(DomainError::Unsupported(
-                "domestic real-account placement is not enabled yet — it waits for the cross-day \
-                 reconcile to be verified on 모의 (#22 P3)"
+                "domestic real-account placement is not enabled yet — it is a deliberate go-live \
+                 after the 모의 cross-day reconcile is confirmed (#22)"
                     .into(),
             ));
         }

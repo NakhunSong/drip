@@ -410,19 +410,11 @@ async fn cmd_tick(
     let position = config
         .find(name)
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
-    if execute && position.broker == "kis-domestic" {
-        // Domestic live placement is gated (the daemon already skips it). drip keys the
-        // at-most-once order key off the US-Eastern date, which rolls over mid-KRX-session
-        // (~13:00 KST) → an intraday rerun could double-place; and domestic fill-reconcile is
-        // unimplemented, so repeated ticks never advance `T` and would over-buy. Both are fixed by
-        // #22 (a KST trading calendar + domestic reconcile). A preview (no `--execute`) is fine.
-        return Err(anyhow!(
-            "domestic (kis-domestic) live placement is gated until #22: the at-most-once order key \
-             uses the US-Eastern date (rolls over mid-KRX-session → intraday double-place) and \
-             domestic fill-reconcile is unimplemented (→ cross-day over-buy). Preview without \
-             `--execute` works."
-        ));
-    }
+    // Domestic 모의 placement is enabled: the KST trading date (#22 P1) removes the
+    // intraday-double-place hazard and `inquire-daily-ccld` reconcile (#22 P2) advances `T`, so
+    // repeated ticks no longer over-buy. A real domestic account is still fenced downstream in
+    // `place()` (a deliberate go-live step); `drip run` still skips domestic (its schedule is
+    // US-Eastern-only — #22 P4).
     let live_broker = connect(
         &position.broker,
         secrets,
