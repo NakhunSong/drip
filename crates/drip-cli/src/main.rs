@@ -515,13 +515,13 @@ async fn cmd_run(
     let mut schedules: Vec<Schedule> = Vec::new();
     for pc in &config.positions {
         if pc.broker == "kis-domestic" {
-            // The domestic adapter can place but cannot reconcile fills yet (a stub), so a daemon
-            // run would never advance the tranche counter `T` and would re-buy day-1 sizing every
-            // day. Refuse to run it here; place domestic positions manually with `drip tick` until
-            // domestic execution-history reconcile lands.
+            // Domestic reconcile + the KST trading date work now (#22 P1/P2), but the daemon's
+            // schedule still fires at a US-Eastern time on the NYSE calendar (schedule.rs); a KRX
+            // position needs KST fire times + the KRX holiday calendar (#22 P4). Skip it here
+            // until the market-aware schedule lands — manual `drip tick` (no schedule) works.
             tracing::warn!(
-                "skipping position '{}': domestic (kis-domestic) execution-history reconcile is \
-                 not implemented — `drip run` would over-buy; use `drip tick` manually",
+                "skipping position '{}': the `drip run` schedule is US-Eastern-only — a KRX \
+                 position needs the KST schedule (#22 P4); place it with `drip tick` for now",
                 pc.name
             );
             continue;

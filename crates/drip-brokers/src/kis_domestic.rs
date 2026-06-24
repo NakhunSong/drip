@@ -16,13 +16,14 @@
 
 use crate::http::{
     RateLimitStore, RateLimiter, TokenCache, TokenStore, broker_err, parse_decimal,
-    parse_price_opt, parse_shares, send_with_retry, today_utc,
+    parse_price_opt, parse_shares, parse_yyyymmdd, send_with_retry, today_utc, yyyymmdd,
 };
 use crate::kis::{KisConfig, KisEnv, kis_cache_filename};
 use async_trait::async_trait;
+use drip_domain::calendar::{Market, trading_date};
 use drip_domain::{
     AccountQuery, BrokerId, BrokerInfo, Capabilities, DomainError, Fill, Holding, Money,
-    OrderGateway, OrderId, OrderIntent, Quote, Quotes, Result, Side, Ticker,
+    OrderGateway, OrderId, OrderIntent, Price, Quote, Quotes, Result, Side, Ticker,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -173,6 +174,14 @@ impl KisDomesticBroker {
             (KisEnv::Paper, Side::Sell) => "VTTC0011U",
         }
     }
+
+    /// Daily-execution-inquiry (`inquire-daily-ccld`, 3개월 이내) `tr_id`, by environment.
+    fn daily_ccld_tr_id(&self) -> &'static str {
+        match self.config.environment {
+            KisEnv::Real => "TTTC0081R",
+            KisEnv::Paper => "VTTC0081R",
+        }
+    }
 }
 
 impl BrokerInfo for KisDomesticBroker {
@@ -263,9 +272,128 @@ impl AccountQuery for KisDomesticBroker {
         Ok(Money::new(parse_decimal(amount)?))
     }
 
-    async fn fills_since(&self, _ticker: &Ticker, _since: time::Date) -> Result<Vec<Fill>> {
-        // Phase 2: domestic execution history via inquire-daily-ccld
-        Ok(Vec::new())
+    async fn fills_since(&self, ticker: &Ticker, since: time::Date) -> Result<Vec<Fill>> {
+        let token = self.token().await?;
+        // Query range in the KRX (KST) calendar — the same trading date the order key and the
+        // reconcile boundary use (#22 P1), and the one `ord_dt` is reported in, so the
+        // "completed days < today" comparison stays apples-to-apples. Clamp a corrupt/future
+        // watermark so we never send INQR_STRT_DT > INQR_END_DT.
+        let today = trading_date(Market::KrEquity, time::OffsetDateTime::now_utc());
+        let start = yyyymmdd(since.min(today));
+        let end = yyyymmdd(today);
+        // 모의 returns the whole account and (like overseas) won't reliably filter by PDNO, so
+        // query broadly and filter to `ticker` client-side; a real account scopes server-side.
+        // INQR_DVSN "01" (정순 = ascending) returns fills oldest-first — the chronological order
+        // `Position::reconcile`/`apply_day` need to resolve same-day cycle boundaries.
+        let pdno_param = match self.config.environment {
+            KisEnv::Real => ticker.as_str(),
+            KisEnv::Paper => "",
+        };
+
+        let mut fills = Vec::new();
+        let (mut fk, mut nk, mut tr_cont) = (String::new(), String::new(), String::new());
+        for _ in 0..MAX_DAILY_CCLD_PAGES {
+            // NOT wrapped in `send_with_retry`: this read accumulates fills across pages and the
+            // reconcile path folds each without de-duping by execution id, so a re-returned page
+            // would over-count → over-buy. A transient 5xx aborts the tick instead (the next fire
+            // retries on a fresh, un-advanced ledger). Single-shot reads (quote, balance) do retry.
+            self.limiter.acquire().await;
+            let resp = self
+                .client
+                .get(format!(
+                    "{}/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                    self.base
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .header("appkey", &self.config.app_key)
+                .header("appsecret", &self.config.app_secret)
+                .header("tr_id", self.daily_ccld_tr_id())
+                .header("custtype", "P")
+                .header("tr_cont", tr_cont.as_str())
+                .query(&[
+                    ("CANO", self.config.cano.as_str()),
+                    ("ACNT_PRDT_CD", self.config.product_code.as_str()),
+                    ("INQR_STRT_DT", start.as_str()),
+                    ("INQR_END_DT", end.as_str()),
+                    ("SLL_BUY_DVSN_CD", "00"),
+                    ("INQR_DVSN", "01"),
+                    ("PDNO", pdno_param),
+                    ("CCLD_DVSN", "01"),
+                    ("ORD_GNO_BRNO", ""),
+                    ("ODNO", ""),
+                    ("INQR_DVSN_3", "00"),
+                    ("INQR_DVSN_1", ""),
+                    ("EXCG_ID_DVSN_CD", "KRX"),
+                    ("CTX_AREA_FK100", fk.as_str()),
+                    ("CTX_AREA_NK100", nk.as_str()),
+                ])
+                .send()
+                .await
+                .map_err(broker_err)?
+                .error_for_status()
+                .map_err(broker_err)?;
+            // The continuation flag is a response *header*: `M`/`F` mean more pages follow.
+            let more = matches!(
+                resp.headers().get("tr_cont").and_then(|v| v.to_str().ok()),
+                Some("M") | Some("F")
+            );
+            let body: KisDailyCcldResp = resp.json().await.map_err(broker_err)?;
+            if body.rt_cd != "0" {
+                return Err(DomainError::Broker(format!(
+                    "KIS domestic inquire-daily-ccld rt_cd={} {}",
+                    body.rt_cd, body.msg1
+                )));
+            }
+            for row in &body.output1 {
+                // Skip other tickers (a paper query returns the whole account) and any row with
+                // nothing filled.
+                if row.pdno.trim() != ticker.as_str() {
+                    continue;
+                }
+                let shares = parse_shares(&row.tot_ccld_qty)?;
+                if shares.is_zero() {
+                    continue;
+                }
+                // Domestic daily-ccld carries no per-fill execution price, so derive the average
+                // from total filled value ÷ filled quantity (gross of fees = the execution price).
+                let amount = parse_decimal(&row.tot_ccld_amt)?;
+                let price = Price::new(amount / Decimal::from(shares.get())).ok_or_else(|| {
+                    DomainError::Broker(format!(
+                        "KIS domestic fill for {ticker} had a non-positive execution amount"
+                    ))
+                })?;
+                // sll_buy_dvsn_cd 01 = 매도 (Sell), 02 = 매수 (Buy) — KIS's universal encoding. An
+                // unknown code is a hard error, never a silent wrong-side fold (which would corrupt
+                // shares / P&L / cycle banking).
+                let side = match row.sll_buy_dvsn_cd.trim() {
+                    "02" => Side::Buy,
+                    "01" => Side::Sell,
+                    other => {
+                        return Err(DomainError::Broker(format!(
+                            "KIS domestic fill had unknown sll_buy_dvsn_cd '{other}'"
+                        )));
+                    }
+                };
+                fills.push(Fill {
+                    side,
+                    shares,
+                    price,
+                    at: parse_yyyymmdd(&row.ord_dt)?,
+                });
+            }
+            if !more {
+                return Ok(fills);
+            }
+            fk = body.ctx_area_fk100.trim().to_string();
+            nk = body.ctx_area_nk100.trim().to_string();
+            tr_cont = "N".to_string();
+        }
+        // Ran past the page cap — surface it rather than silently truncating (under-count →
+        // over-buy).
+        Err(DomainError::Broker(format!(
+            "KIS domestic inquire-daily-ccld exceeded {MAX_DAILY_CCLD_PAGES} pages for {ticker}; \
+             narrow the window"
+        )))
     }
 }
 
@@ -285,13 +413,14 @@ fn etf_tick_round(price: Decimal) -> Decimal {
 #[async_trait]
 impl OrderGateway for KisDomesticBroker {
     async fn place(&self, ticker: &Ticker, order: &OrderIntent) -> Result<OrderId> {
-        // Real-account placement waits for execution-history reconcile (#22): the domestic
-        // `fills_since` is still a stub, so without it `T` can't advance from fills and repeated
-        // real placement would over-buy. 모의 (a fresh ledger each test) is fine.
+        // Real-account placement is fenced until the cross-day place→reconcile round-trip is
+        // verified live on 모의 (#22 P3). `fills_since` now advances `T` from fills (P2), but
+        // turning on real money is a production-safety step gated on that fresh evidence, not on
+        // reasoning. 모의 (a fresh ledger each test) is fine.
         if matches!(self.config.environment, KisEnv::Real) {
             return Err(DomainError::Unsupported(
-                "domestic real-account placement is not enabled yet — it waits for \
-                 execution-history reconcile (#22)"
+                "domestic real-account placement is not enabled yet — it waits for the cross-day \
+                 reconcile to be verified on 모의 (#22 P3)"
                     .into(),
             ));
         }
@@ -436,13 +565,50 @@ struct KisOrderOutput {
     krx_fwdg_ord_orgno: String,
 }
 
+/// Page cap for paginated `inquire-daily-ccld` (모의 returns ~15 rows/page). Generous for a few
+/// days of one account's orders; hitting it is surfaced as an error rather than silently
+/// truncating fills (under-counting would make the strategy over-buy).
+const MAX_DAILY_CCLD_PAGES: usize = 50;
+
+/// `inquire-daily-ccld` response — `output1` is the per-order array (a filled row carries
+/// `tot_ccld_qty`/`tot_ccld_amt`); `output2` is an account summary drip ignores. Like the other
+/// inquiry endpoints the field names are lowercase, with the `100` pagination keys in the body.
+#[derive(Debug, Deserialize)]
+struct KisDailyCcldResp {
+    #[serde(default)]
+    rt_cd: String,
+    #[serde(default)]
+    msg1: String,
+    #[serde(default)]
+    output1: Vec<KisDailyCcldRow>,
+    #[serde(default)]
+    ctx_area_fk100: String,
+    #[serde(default)]
+    ctx_area_nk100: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KisDailyCcldRow {
+    #[serde(default)]
+    ord_dt: String,
+    #[serde(default)]
+    pdno: String,
+    #[serde(default)]
+    sll_buy_dvsn_cd: String,
+    #[serde(default)]
+    tot_ccld_qty: String,
+    #[serde(default)]
+    tot_ccld_amt: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kis::KisExchange;
     use drip_domain::{Price, Shares};
     use rust_decimal_macros::dec;
-    use wiremock::matchers::{body_partial_json, method, path};
+    use time::macros::date;
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn config() -> KisConfig {
@@ -632,5 +798,53 @@ mod tests {
             "loc",
         );
         assert!(broker.place(&Ticker::new("122630"), &intent).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fills_since_derives_the_price_and_skips_unfilled_and_other_tickers() {
+        let server = MockServer::start().await;
+        mock_token(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/uapi/domestic-stock/v1/trading/inquire-daily-ccld"))
+            .and(header("tr_id", "VTTC0081R")) // paper, 3개월 이내
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rt_cd": "0", "msg1": "ok", "ctx_area_fk100": "", "ctx_area_nk100": "",
+                "output1": [
+                    // Filled buy of our ticker: 2 shares, 376,950원 total → 188,475원 avg price.
+                    {"ord_dt": "20260624", "pdno": "122630", "sll_buy_dvsn_cd": "02",
+                     "tot_ccld_qty": "2", "tot_ccld_amt": "376950"},
+                    // A later filled sell.
+                    {"ord_dt": "20260625", "pdno": "122630", "sll_buy_dvsn_cd": "01",
+                     "tot_ccld_qty": "1", "tot_ccld_amt": "200000"},
+                    // Ordered but nothing filled yet -> skip.
+                    {"ord_dt": "20260624", "pdno": "122630", "sll_buy_dvsn_cd": "02",
+                     "tot_ccld_qty": "0", "tot_ccld_amt": "0"},
+                    // A different ticker (a paper query returns the whole account) -> skip.
+                    {"ord_dt": "20260624", "pdno": "069500", "sll_buy_dvsn_cd": "02",
+                     "tot_ccld_qty": "5", "tot_ccld_amt": "100000"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let fills = broker(server.uri())
+            .fills_since(&Ticker::new("122630"), date!(2026 - 06 - 01))
+            .await
+            .unwrap();
+        assert_eq!(fills.len(), 2);
+        // The execution price is derived from total filled value ÷ filled quantity.
+        assert_eq!(
+            fills[0],
+            Fill {
+                side: Side::Buy,
+                shares: Shares::new(2),
+                price: Price::new(dec!(188475)).unwrap(),
+                at: date!(2026 - 06 - 24),
+            }
+        );
+        assert_eq!(fills[1].side, Side::Sell);
+        assert_eq!(fills[1].shares, Shares::new(1));
+        assert_eq!(fills[1].price, Price::new(dec!(200000)).unwrap());
+        assert_eq!(fills[1].at, date!(2026 - 06 - 25));
     }
 }
