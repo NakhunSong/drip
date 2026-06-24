@@ -10,6 +10,7 @@ use drip_app::{
     dry_run, fetch_quote, list_positions, place_orders, reconcile, run_backtest,
 };
 use drip_brokers::{LiveBroker, connect};
+use drip_domain::calendar::{Market, trading_date};
 use drip_domain::{Position, Schedule, StateRepository, Strategy, Ticker, Trigger};
 use drip_infra::{
     AppConfig, CsvMarketData, FileSecretStore, PositionConfig, SqliteStateRepository, parse_date,
@@ -375,6 +376,17 @@ async fn cmd_dry_run(
     Ok(())
 }
 
+/// The market whose trading calendar applies to a position, by its configured broker.
+/// `kis-domestic` (and Toss) trade on KRX → KST sessions; everything else is treated as US
+/// equities. Drives the trading-date computation that the idempotency key and the reconcile
+/// boundary key on, so a same-session rerun maps to one date.
+fn position_market(broker: &str) -> Market {
+    match broker {
+        "kis-domestic" | "toss" => Market::KrEquity,
+        _ => Market::UsEquity,
+    }
+}
+
 async fn cmd_tick(
     name: &str,
     execute: bool,
@@ -416,10 +428,13 @@ async fn cmd_tick(
     let registry = StrategyRegistry::with_builtins();
     let strategy = registry.build(&position.strategy, &position.strategy_params())?;
     let repo = SqliteStateRepository::open(state_path)?;
-    // drip's trading date is the US Eastern session date, so the at-most-once order key stays
-    // stable across an after-hours rerun (issue #3) — a UTC date would flip after the Eastern
-    // close and risk a double-place.
-    let today = drip_domain::calendar::us_eastern_date(time::OffsetDateTime::now_utc());
+    // drip's trading date is the position's market session date, so the at-most-once order key
+    // stays stable across a same-session rerun (issue #3 / #22) — a UTC date, or the US-Eastern
+    // date for a KRX order, would flip mid-session and risk a double-place.
+    let today = trading_date(
+        position_market(&position.broker),
+        time::OffsetDateTime::now_utc(),
+    );
     let ports = TickPorts {
         quotes: live_broker.as_quotes(),
         gateway,
@@ -456,9 +471,12 @@ async fn cmd_reconcile(
         Some(drip_infra::drip_home()?.as_path()),
     )?;
     let repo = SqliteStateRepository::open(state_path)?;
-    // US Eastern session date (issue #3): the reconcile boundary "completed days < today" must
-    // use the exchange's date, matching the Eastern `ord_dt` the broker reports.
-    let today = drip_domain::calendar::us_eastern_date(time::OffsetDateTime::now_utc());
+    // The position's market session date (issue #3 / #22): the reconcile boundary "completed
+    // days < today" must use the exchange's date, matching the `ord_dt` the broker reports.
+    let today = trading_date(
+        position_market(&position.broker),
+        time::OffsetDateTime::now_utc(),
+    );
     let view = reconcile(live.as_account(), &repo, position.to_position()?, today).await?;
     print_reconcile(name, &view);
     Ok(())
@@ -471,6 +489,8 @@ struct EngineJob {
     broker: LiveBroker,
     strategy: Box<dyn Strategy>,
     template: Position,
+    /// The position's market, for the per-fire trading date (resolved once at startup).
+    market: Market,
 }
 
 async fn cmd_run(
@@ -495,13 +515,13 @@ async fn cmd_run(
     let mut schedules: Vec<Schedule> = Vec::new();
     for pc in &config.positions {
         if pc.broker == "kis-domestic" {
-            // The domestic adapter can place but cannot reconcile fills yet (a stub), so a daemon
-            // run would never advance the tranche counter `T` and would re-buy day-1 sizing every
-            // day. Refuse to run it here; place domestic positions manually with `drip tick` until
-            // domestic execution-history reconcile lands.
+            // Domestic reconcile + the KST trading date work now (#22 P1/P2), but the daemon's
+            // schedule still fires at a US-Eastern time on the NYSE calendar (schedule.rs); a KRX
+            // position needs KST fire times + the KRX holiday calendar (#22 P4). Skip it here
+            // until the market-aware schedule lands — manual `drip tick` (no schedule) works.
             tracing::warn!(
-                "skipping position '{}': domestic (kis-domestic) execution-history reconcile is \
-                 not implemented — `drip run` would over-buy; use `drip tick` manually",
+                "skipping position '{}': the `drip run` schedule is US-Eastern-only — a KRX \
+                 position needs the KST schedule (#22 P4); place it with `drip tick` for now",
                 pc.name
             );
             continue;
@@ -534,6 +554,7 @@ async fn cmd_run(
             broker,
             strategy,
             template: pc.to_position()?,
+            market: position_market(&pc.broker),
         });
     }
 
@@ -563,7 +584,7 @@ async fn cmd_run(
                 repo: &repo,
                 journal: &repo,
             };
-            let today = drip_domain::calendar::us_eastern_date(now);
+            let today = trading_date(job.market, now);
             let view = place_orders(
                 &ports,
                 job.template.clone(),
@@ -733,4 +754,19 @@ fn print_report(report: &BacktestReport) {
     );
     println!("  max drawdown   {:.2}%", report.max_drawdown * 100.0);
     println!("  CAGR           {:.2}%", report.cagr * 100.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_market_maps_domestic_brokers_to_korea() {
+        // kis-domestic places on KRX, so its trading date must be KST (the #22 fix); the
+        // overseas KIS adapter stays US Eastern. Toss is a Korean broker too.
+        assert_eq!(position_market("kis-domestic"), Market::KrEquity);
+        assert_eq!(position_market("toss"), Market::KrEquity);
+        assert_eq!(position_market("kis"), Market::UsEquity);
+        assert_eq!(position_market("paper"), Market::UsEquity);
+    }
 }

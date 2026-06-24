@@ -1,16 +1,41 @@
-//! Market calendar — pure, deterministic US-market date logic.
+//! Market calendar — pure, deterministic trading-date logic, per [`Market`].
 //!
-//! The US trading calendar is a property of the *market*, not of any one broker, so it lives
+//! A trading calendar is a property of the *market*, not of any one broker, so it lives
 //! in the domain (like [`settle`](crate::settle) and [`risk`](crate::risk)) and is shared by
 //! the CLI, the scheduler engine, and broker adapters. Every function takes the current
 //! instant (or a date) as input and performs no I/O, so it is fully unit-testable offline.
 //!
-//! drip's canonical "trading date" is the **US Eastern** session date. The idempotency key
-//! and the reconcile boundary key on it, so a rerun at any wall-clock time — even after UTC
-//! midnight while it is still the same Eastern session — maps to the same date.
+//! drip's canonical "trading date" is the market's local **session date** —
+//! [`Market::UsEquity`] uses US Eastern (DST-aware), [`Market::KrEquity`] uses Korea (KST,
+//! UTC+9, no DST). The idempotency key and the reconcile boundary key on it, so a rerun at
+//! any wall-clock time — even after UTC midnight while it is still the same local session —
+//! maps to one date. (Holiday sets feed only [`is_trading_day`], used by the scheduler, which
+//! covers NYSE only; KRX holidays arrive with the domestic daemon — see #22.)
 
 use time::macros::{offset, time};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset, Weekday};
+
+/// The market whose trading calendar applies to a position — selects the session time zone
+/// (and, for the scheduler, the holiday set). Derived from the position's broker at the
+/// composition root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Market {
+    /// US equities — sessions keyed to US Eastern time (DST-aware), NYSE holidays.
+    UsEquity,
+    /// Korean equities (KRX) — sessions keyed to Korea Standard Time (UTC+9, no DST).
+    KrEquity,
+}
+
+/// The market's local trading-date for a UTC instant — the date drip keys the idempotency
+/// key and the reconcile boundary on, so a rerun later the same session maps to one date.
+/// US uses the DST-aware Eastern date; Korea uses KST (UTC+9, no daylight saving), so the
+/// date never flips mid-session the way the Eastern date does for a KRX instant.
+pub fn trading_date(market: Market, now: OffsetDateTime) -> Date {
+    match market {
+        Market::UsEquity => us_eastern_date(now),
+        Market::KrEquity => now.to_offset(offset!(+9)).date(),
+    }
+}
 
 /// The US Eastern calendar date for a UTC instant, honoring daylight saving time.
 ///
@@ -282,5 +307,47 @@ mod tests {
         assert!(!is_trading_day(date!(2026 - 07 - 03))); // Independence Day observed
         assert!(!is_trading_day(date!(2026 - 12 - 25))); // Christmas
         assert!(is_trading_day(date!(2026 - 12 - 24))); // Christmas Eve still trades
+    }
+
+    #[test]
+    fn korea_trading_date_is_stable_across_the_eastern_rollover_intraday() {
+        // The #22 bug: two `drip tick` runs in the same KRX session (Wed 2026-06-24, 12:00 and
+        // 14:30 KST = 03:00 and 05:30 UTC) must hash to ONE idempotency key. The US-Eastern date
+        // rolls between them (13:00 KST ≈ Eastern midnight), so keying a KRX order on it would
+        // split into two keys and double-place; the KST trading date stays 06-24 for both.
+        let noon_kst = datetime!(2026-06-24 03:00 UTC);
+        let afternoon_kst = datetime!(2026-06-24 05:30 UTC);
+        assert_eq!(
+            trading_date(Market::KrEquity, noon_kst),
+            date!(2026 - 06 - 24)
+        );
+        assert_eq!(
+            trading_date(Market::KrEquity, afternoon_kst),
+            date!(2026 - 06 - 24)
+        );
+        // The same instants on the US-Eastern calendar straddle midnight → two different dates.
+        assert_ne!(us_eastern_date(noon_kst), us_eastern_date(afternoon_kst));
+    }
+
+    #[test]
+    fn us_trading_date_matches_the_eastern_date() {
+        let now = datetime!(2026-06-23 01:00 UTC);
+        assert_eq!(trading_date(Market::UsEquity, now), us_eastern_date(now));
+        assert_eq!(trading_date(Market::UsEquity, now), date!(2026 - 06 - 22));
+    }
+
+    #[test]
+    fn korea_trading_date_has_no_dst_shift() {
+        // KST is UTC+9 year-round (Korea has no DST), so winter and summer instants convert with
+        // the same offset — unlike the US Eastern date. 15:00 UTC = 00:00 KST the next day, both
+        // seasons.
+        assert_eq!(
+            trading_date(Market::KrEquity, datetime!(2026-01-15 15:00 UTC)),
+            date!(2026 - 01 - 16)
+        );
+        assert_eq!(
+            trading_date(Market::KrEquity, datetime!(2026-07-15 15:00 UTC)),
+            date!(2026 - 07 - 16)
+        );
     }
 }
