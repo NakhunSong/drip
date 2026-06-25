@@ -35,6 +35,15 @@ Dependency rule: everything points inward to `drip-domain`. Order of crates:
 - One fill rule: `drip_domain::settle`. Don't reimplement fill logic anywhere else.
 - `Position` = drip's strategy ledger (seed/splits/T/cycle). `Holding` = broker-reported
   shares/avg. Don't conflate them.
+- **Account isolation.** A position's identity is `(account, ticker)` — `AccountId` (a
+  drip-domain newtype) is the isolation namespace for its ledger *and* its `OrderJournal` keys, so
+  a 모의 and a 실전 position on the same ticker never share state (and a paper order key never
+  suppresses the real one). The **broker** stays the *adapter* identity
+  (`kis`/`kis-domestic`/`toss`/`paper`); the **account** carries credentials + environment. An
+  account's `env` (paper/real) lives in config `[[accounts]]`; positions reference it by
+  `--account`. On startup `drip_infra::migrate_to_accounts` brings a pre-account home to this
+  model (idempotent; backs up state.db, re-keys the ledger + order journal). Manage accounts with
+  `drip account add|toss|show`.
 - New strategy → add an adapter in `drip-strategies` and register it in `StrategyRegistry`.
   Nothing downstream changes (OCP).
 - New broker → implement the capability ports it supports; declare them in `capabilities()`.
@@ -63,7 +72,9 @@ Dependency rule: everything points inward to `drip-domain`. Order of crates:
   `place_orders`.
 - Errors map to `DomainError` at adapter boundaries. The CLI uses `anyhow` at the top.
 - Secrets: `FileSecretStore` (`~/.drip/secrets.toml`, `0600`). Never log secret values.
-  Secret keys use underscores (`kis_app_key`), never dots (dots are TOML nesting).
+  Credentials are **account-namespaced** via `AccountId::secret_key` → `{account}_{field}` (e.g.
+  `kis-paper_app_key`) — the one owner of that format; keys use underscores/hyphens, **never dots**
+  (dots nest in TOML, breaking the flat store).
 - **KIS rate limit & token.** KIS throttles per second — 모의 strictly (~1/s; it returns
   `EGW00201` "초당 거래건수 초과"), 실전 ~20/s — and issues ~1 OAuth token/min per app key. The
   KIS adapter spaces every request through a per-environment `RateLimiter` (don't remove it, or
@@ -117,6 +128,11 @@ docs/                   # M2 engine design sketch
   `inquire-daily-ccld` (per-fill price = total amount ÷ qty). P3: 모의 placement enabled
   (`drip tick --execute`; `drip fills` prints raw executions). **A real domestic account stays
   fenced** in `place()` (a deliberate go-live); `drip run` **skips domestic** (US-only schedule).
+- **Account isolation (paper/real, done):** positions are keyed `(account, ticker)`; credentials,
+  config `env`, and the ledger + order-journal are all account-namespaced, so 모의 and 실전 are
+  separate accounts that never cross. `drip account add|toss|show`; `drip status` shows the env.
+  An existing home auto-migrates on startup (state.db backed up first). This is the **foundation
+  for a safe real go-live** — the real-money domestic fence (above) is the next, separate step.
 - **Still out of scope (M3+):** WebSocket quotes / realtime triggers (`OnTick`/`OnPriceCross`),
   Rhai strategies, OS-keychain secrets, rate-limiting, notifications, Toss order placement (no
   모의 sandbox), **domestic `drip run` scheduling + KRX holiday calendar (#22 P4)**, and a

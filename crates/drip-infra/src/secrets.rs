@@ -79,4 +79,29 @@ mod tests {
         store.delete("kis_app_key").unwrap();
         assert_eq!(store.get("kis_app_key").unwrap(), None);
     }
+
+    #[test]
+    fn account_prefixed_key_round_trips_as_a_flat_key() {
+        // The account model stores credentials under `{account}_{field}` (e.g. `kis-paper_app_key`).
+        // The hyphen in the account name must survive a TOML write/read as one flat key — not
+        // become a nested table the way a dot would. Reload from disk to exercise the file path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.toml");
+        FileSecretStore::new(path.clone())
+            .set("kis-paper_app_key", "paper-key")
+            .unwrap();
+        FileSecretStore::new(path.clone())
+            .set("kis-real_app_key", "real-key")
+            .unwrap();
+        // A fresh store reading the same file proves both persisted as distinct flat keys.
+        let reloaded = FileSecretStore::new(path);
+        assert_eq!(
+            reloaded.get("kis-paper_app_key").unwrap().as_deref(),
+            Some("paper-key")
+        );
+        assert_eq!(
+            reloaded.get("kis-real_app_key").unwrap().as_deref(),
+            Some("real-key")
+        );
+    }
 }

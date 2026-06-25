@@ -83,9 +83,9 @@ async fn compute_intents(
     template: Position,
     strategy: &dyn Strategy,
 ) -> Result<(Position, Quote, Vec<OrderIntent>)> {
-    let broker = template.broker;
+    let account = template.account.clone();
     let ticker = template.ticker.clone();
-    let state = repo.load(broker, &ticker).await?.unwrap_or(template);
+    let state = repo.load(&account, &ticker).await?.unwrap_or(template);
     let (quote, intents) = decide_on(quotes, &state, strategy).await?;
     Ok((state, quote, intents))
 }
@@ -157,9 +157,9 @@ async fn reconcile_into(
     today: Date,
     persist: bool,
 ) -> Result<(Position, ReconcileView)> {
-    let broker = template.broker;
+    let account_id = template.account.clone();
     let ticker = template.ticker.clone();
-    let mut state = repo.load(broker, &ticker).await?.unwrap_or(template);
+    let mut state = repo.load(&account_id, &ticker).await?.unwrap_or(template);
     let t_before = state.t();
     let since = state
         .reconciled_through
@@ -286,7 +286,7 @@ pub async fn place_orders(
         risk::vet(intent, &state, quote.price)?;
     }
 
-    let broker = state.broker;
+    let account = state.account.clone();
     let ticker = state.ticker.clone();
     let mut notes: Vec<String> = Vec::new();
     if let Some(n) = recon.note {
@@ -314,7 +314,7 @@ pub async fn place_orders(
             });
             continue;
         }
-        let key = intent.client_key(broker, &ticker, today);
+        let key = intent.client_key(&account, &ticker, today);
         if !ports.journal.reserve(&key).await? {
             orders.push(TickOrder {
                 intent,
@@ -380,7 +380,7 @@ mod tests {
     use super::*;
     use drip_brokers::PaperBroker;
     use drip_domain::{
-        Bar, BrokerInfo, Capabilities, Fill, OrderGateway, OrderId, OrderJournal,
+        AccountId, Bar, BrokerInfo, Capabilities, Fill, OrderGateway, OrderId, OrderJournal,
         Price as DomainPrice, Shares, Side,
     };
     use drip_strategies::{InfiniteBuying, InfiniteBuyingConfig};
@@ -401,7 +401,7 @@ mod tests {
     struct FlatRepo;
     #[async_trait::async_trait]
     impl StateRepository for FlatRepo {
-        async fn load(&self, _b: BrokerId, _t: &Ticker) -> Result<Option<Position>> {
+        async fn load(&self, _account: &AccountId, _t: &Ticker) -> Result<Option<Position>> {
             Ok(None)
         }
         async fn save(&self, _p: &Position) -> Result<()> {
@@ -479,6 +479,7 @@ mod tests {
         let strategy = InfiniteBuying::new(InfiniteBuyingConfig::default());
 
         let template = Position::new(
+            AccountId::new("paper"),
             BrokerId::Paper,
             Ticker::new("TQQQ"),
             Money::new(dec!(40000)),
@@ -510,6 +511,7 @@ mod tests {
         };
         let template = || {
             Position::new(
+                AccountId::new("paper"),
                 BrokerId::Paper,
                 Ticker::new("TQQQ"),
                 Money::new(dec!(40000)),
@@ -556,6 +558,7 @@ mod tests {
             journal: &journal,
         };
         let template = Position::new(
+            AccountId::new("paper"),
             BrokerId::Paper,
             Ticker::new("TQQQ"),
             Money::new(dec!(40000)),
@@ -597,6 +600,7 @@ mod tests {
         };
         let template = || {
             Position::new(
+                AccountId::new("paper"),
                 BrokerId::Paper,
                 Ticker::new("TQQQ"),
                 Money::new(dec!(40000)),
@@ -622,24 +626,28 @@ mod tests {
     }
 
     // A state repository that persists in memory — exercises reconcile's save/reload (FlatRepo
-    // is always empty, so it can't show the ledger advancing).
+    // is always empty, so it can't show the ledger advancing). Keyed by (account, ticker), as the
+    // real sqlite store is.
     #[derive(Default)]
-    struct MemRepo(std::sync::Mutex<std::collections::HashMap<(BrokerId, String), Position>>);
+    struct MemRepo(std::sync::Mutex<std::collections::HashMap<(String, String), Position>>);
     #[async_trait::async_trait]
     impl StateRepository for MemRepo {
-        async fn load(&self, b: BrokerId, t: &Ticker) -> Result<Option<Position>> {
+        async fn load(&self, account: &AccountId, t: &Ticker) -> Result<Option<Position>> {
             Ok(self
                 .0
                 .lock()
                 .unwrap()
-                .get(&(b, t.as_str().to_string()))
+                .get(&(account.as_str().to_string(), t.as_str().to_string()))
                 .cloned())
         }
         async fn save(&self, p: &Position) -> Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert((p.broker, p.ticker.as_str().to_string()), p.clone());
+            self.0.lock().unwrap().insert(
+                (
+                    p.account.as_str().to_string(),
+                    p.ticker.as_str().to_string(),
+                ),
+                p.clone(),
+            );
             Ok(())
         }
         async fn list(&self) -> Result<Vec<Position>> {
@@ -707,6 +715,7 @@ mod tests {
 
     fn paper_template() -> Position {
         Position::new(
+            AccountId::new("paper"),
             BrokerId::Paper,
             Ticker::new("TQQQ"),
             Money::new(dec!(32000)),
@@ -744,7 +753,7 @@ mod tests {
 
         // Persisted: a reloaded position reflects the fills and the watermark.
         let saved = repo
-            .load(BrokerId::Paper, &Ticker::new("TQQQ"))
+            .load(&AccountId::new("paper"), &Ticker::new("TQQQ"))
             .await
             .unwrap()
             .unwrap();
@@ -802,7 +811,7 @@ mod tests {
         assert_eq!(preview.reconciled_fills, 1);
         assert_eq!(preview.t, dec!(1)); // 8 * 100 = 800 against an 800 budget -> T = 1.0
         let after_preview = repo
-            .load(BrokerId::Paper, &Ticker::new("TQQQ"))
+            .load(&AccountId::new("paper"), &Ticker::new("TQQQ"))
             .await
             .unwrap()
             .unwrap();
@@ -815,7 +824,7 @@ mod tests {
             .unwrap();
         assert_eq!(executed.reconciled_fills, 1);
         let after_execute = repo
-            .load(BrokerId::Paper, &Ticker::new("TQQQ"))
+            .load(&AccountId::new("paper"), &Ticker::new("TQQQ"))
             .await
             .unwrap()
             .unwrap();

@@ -5,14 +5,16 @@
 pub mod config;
 pub mod data;
 pub mod logging;
+pub mod migrate;
 pub mod secrets;
 pub mod state;
 
 use drip_domain::{DomainError, Result};
 use std::path::PathBuf;
 
-pub use config::{AppConfig, PositionConfig};
+pub use config::{AccountConfig, AppConfig, PositionConfig};
 pub use data::CsvMarketData;
+pub use migrate::{MigrationReport, migrate_to_accounts};
 pub use secrets::FileSecretStore;
 pub use state::SqliteStateRepository;
 

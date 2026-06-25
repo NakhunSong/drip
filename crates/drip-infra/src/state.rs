@@ -1,13 +1,20 @@
 //! A sqlite-backed [`StateRepository`]. Positions are stored as JSON keyed by
-//! (broker, ticker). sqlite is bundled into the binary (no system dependency); connections
-//! are opened per call, which is ample for a single-user CLI's low-frequency state writes.
+//! (account, ticker) — the account is the isolation namespace, so a 모의 and a 실전 ledger on
+//! the same ticker never share a row (see [`drip_domain::AccountId`]; pre-account databases are
+//! migrated by [`crate::migrate`]). sqlite is bundled into the binary (no system dependency);
+//! connections are opened per call, which is ample for a single-user CLI's low-frequency writes.
 
 use async_trait::async_trait;
 use drip_domain::{
-    BrokerId, DomainError, OrderId, OrderJournal, Position, Result, StateRepository, Ticker,
+    AccountId, DomainError, OrderId, OrderJournal, Position, Result, StateRepository, Ticker,
 };
 use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
+
+/// The columns + primary key of the positions table, keyed by `(account, ticker)`. Shared with
+/// [`crate::migrate`] (which rebuilds the table under a temporary name) so the two `CREATE TABLE`
+/// statements can never drift on the schema.
+pub(crate) const POSITIONS_COLUMNS: &str = "account TEXT NOT NULL, ticker TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (account, ticker)";
 
 /// Persists positions in a sqlite database file.
 #[derive(Debug, Clone)]
@@ -20,12 +27,7 @@ impl SqliteStateRepository {
         let repo = SqliteStateRepository { path };
         let conn = repo.conn()?;
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS positions (
-                broker TEXT NOT NULL,
-                ticker TEXT NOT NULL,
-                data   TEXT NOT NULL,
-                PRIMARY KEY (broker, ticker)
-            )",
+            &format!("CREATE TABLE IF NOT EXISTS positions ({POSITIONS_COLUMNS})"),
             [],
         )
         .map_err(storage_err)?;
@@ -50,12 +52,12 @@ impl SqliteStateRepository {
 
 #[async_trait]
 impl StateRepository for SqliteStateRepository {
-    async fn load(&self, broker: BrokerId, ticker: &Ticker) -> Result<Option<Position>> {
+    async fn load(&self, account: &AccountId, ticker: &Ticker) -> Result<Option<Position>> {
         let conn = self.conn()?;
         let json: Option<String> = conn
             .query_row(
-                "SELECT data FROM positions WHERE broker = ?1 AND ticker = ?2",
-                (broker.to_string(), ticker.as_str()),
+                "SELECT data FROM positions WHERE account = ?1 AND ticker = ?2",
+                (account.as_str(), ticker.as_str()),
                 |row| row.get(0),
             )
             .optional()
@@ -70,8 +72,8 @@ impl StateRepository for SqliteStateRepository {
         let data = serde_json::to_string(position).map_err(storage_err)?;
         self.conn()?
             .execute(
-                "INSERT OR REPLACE INTO positions (broker, ticker, data) VALUES (?1, ?2, ?3)",
-                (position.broker.to_string(), position.ticker.as_str(), data),
+                "INSERT OR REPLACE INTO positions (account, ticker, data) VALUES (?1, ?2, ?3)",
+                (position.account.as_str(), position.ticker.as_str(), data),
             )
             .map_err(storage_err)?;
         Ok(())
@@ -80,7 +82,7 @@ impl StateRepository for SqliteStateRepository {
     async fn list(&self) -> Result<Vec<Position>> {
         let conn = self.conn()?;
         let mut stmt = conn
-            .prepare("SELECT data FROM positions ORDER BY broker, ticker")
+            .prepare("SELECT data FROM positions ORDER BY account, ticker")
             .map_err(storage_err)?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
@@ -130,7 +132,7 @@ fn storage_err(e: impl std::fmt::Display) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use drip_domain::{Money, Ticker};
+    use drip_domain::{BrokerId, Money};
     use rust_decimal_macros::dec;
 
     #[tokio::test]
@@ -138,6 +140,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqliteStateRepository::open(dir.path().join("state.db")).unwrap();
         let position = Position::new(
+            AccountId::new("kis-paper"),
             BrokerId::Kis,
             Ticker::new("TQQQ"),
             Money::new(dec!(4000)),
@@ -146,13 +149,15 @@ mod tests {
         repo.save(&position).await.unwrap();
 
         let loaded = repo
-            .load(BrokerId::Kis, &Ticker::new("TQQQ"))
+            .load(&AccountId::new("kis-paper"), &Ticker::new("TQQQ"))
             .await
             .unwrap();
         assert_eq!(loaded, Some(position));
         assert_eq!(repo.list().await.unwrap().len(), 1);
+        // The same ticker under a different account is a separate ledger row — the isolation
+        // guarantee that keeps a 실전 position off the 모의 ledger.
         assert!(
-            repo.load(BrokerId::Toss, &Ticker::new("TQQQ"))
+            repo.load(&AccountId::new("kis-real"), &Ticker::new("TQQQ"))
                 .await
                 .unwrap()
                 .is_none()
@@ -163,11 +168,15 @@ mod tests {
     async fn order_journal_reserves_at_most_once_then_records_id() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqliteStateRepository::open(dir.path().join("state.db")).unwrap();
-        let key = "kis:TQQQ:2026-06-21:loc_low";
+        let key = "kis-paper:TQQQ:2026-06-21:loc_low";
 
         assert!(repo.reserve(key).await.unwrap()); // first reservation wins
         assert!(!repo.reserve(key).await.unwrap()); // same key is refused
-        assert!(repo.reserve("kis:TQQQ:2026-06-21:loc_high").await.unwrap()); // distinct key
+        assert!(
+            repo.reserve("kis-paper:TQQQ:2026-06-21:loc_high")
+                .await
+                .unwrap()
+        ); // distinct key
 
         // Recording the broker id for a reserved key succeeds.
         repo.record(key, &OrderId::new("0000/0030")).await.unwrap();

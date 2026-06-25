@@ -1,7 +1,7 @@
 //! Position, cycle accounting, and [`Fill`] — the persisted state of an averaging
 //! strategy on one ticker.
 
-use crate::market::{BrokerId, Side, Ticker};
+use crate::market::{AccountId, BrokerId, Side, Ticker};
 use crate::money::{Money, Price, Shares};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,12 @@ impl Fill {
 /// `avg_price` is `None` exactly when the position is flat (between cycles).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Position {
+    /// The account this position trades under — the isolation namespace for its ledger and its
+    /// order-journal keys (see [`AccountId`]). `#[serde(default)]` keeps positions stored before
+    /// accounts existed loadable; the account migration (drip-infra) sets the real value, so a
+    /// live position is never left with the empty default.
+    #[serde(default)]
+    pub account: AccountId,
     pub broker: BrokerId,
     pub ticker: Ticker,
     pub seed: Money,
@@ -47,8 +53,15 @@ pub struct Position {
 
 impl Position {
     /// A fresh, flat position ready to start cycle 0.
-    pub fn new(broker: BrokerId, ticker: Ticker, seed: Money, splits: u32) -> Position {
+    pub fn new(
+        account: AccountId,
+        broker: BrokerId,
+        ticker: Ticker,
+        seed: Money,
+        splits: u32,
+    ) -> Position {
         Position {
+            account,
             broker,
             ticker,
             seed,
@@ -243,6 +256,7 @@ mod tests {
 
     fn tqqq() -> Position {
         Position::new(
+            AccountId::new("paper"),
             BrokerId::Paper,
             Ticker::new("TQQQ"),
             Money::new(dec!(32000)),

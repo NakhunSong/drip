@@ -11,6 +11,15 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
 
 ### Added
 
+- **Per-account isolation (모의 vs 실전).** Each brokerage account — its credentials, environment,
+  and ledger — is isolated: positions are keyed by `(account, ticker)`, so KIS 모의 (`kis-paper`)
+  and 실전 (`kis-real`) are separate accounts that never reinterpret a position or cross ledgers
+  (the order-placement guard is account-scoped too, so a paper order can't suppress the real one).
+  Manage accounts with `drip account add` (KIS), `drip account toss`, and `drip account show`;
+  attach a position with `drip strategy add --account <name>`; `drip status` shows each position's
+  account and environment (`[REAL]`/`[paper]`). An existing `~/.drip` is migrated automatically on
+  the next run — credentials move under their account, the ledger and order journal are re-keyed
+  (state.db is backed up first), and existing positions are assigned a `kis-<env>` account.
 - **`drip tick` — live order placement on 한국투자증권 (KIS).** Computes a position's
   infinite-buying orders for today and, with `--execute`, places them. Preview (dry-run) by
   default — nothing is sent without `--execute`.
@@ -43,6 +52,10 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
 
 ### Changed
 
+- **`drip keys` → `drip account`.** Credentials are stored per named account (`{account}_{field}`
+  in `secrets.toml`) instead of one global `kis_*` set, so 모의 and 실전 keys coexist. `drip
+  account --broker` (holdings) is now `drip account show --name --broker`, and `drip quote` (and
+  the web quote/account endpoints) take an `--account`.
 - **KIS is no longer read-only** — it can place US overseas orders (LOC / limit). Going live is
   guarded at runtime (capability + dry-run default + `--live` + risk check + idempotency)
   instead of being blocked by the type system. **토스증권 (Toss) stays read-only** (it has no

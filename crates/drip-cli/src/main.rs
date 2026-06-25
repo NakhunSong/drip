@@ -11,9 +11,10 @@ use drip_app::{
 };
 use drip_brokers::{LiveBroker, connect};
 use drip_domain::calendar::{Market, trading_date};
-use drip_domain::{Position, Schedule, StateRepository, Strategy, Ticker, Trigger};
+use drip_domain::{AccountId, Position, Schedule, StateRepository, Strategy, Ticker, Trigger};
 use drip_infra::{
-    AppConfig, CsvMarketData, FileSecretStore, PositionConfig, SqliteStateRepository, parse_date,
+    AccountConfig, AppConfig, CsvMarketData, FileSecretStore, PositionConfig,
+    SqliteStateRepository, parse_date,
 };
 use drip_strategies::StrategyRegistry;
 use rust_decimal::Decimal;
@@ -38,19 +39,17 @@ struct Cli {
 enum Command {
     /// Initialize the drip home directory and config.
     Init,
-    /// Store broker API credentials (in ~/.drip/secrets.toml, 0600) and validate them.
-    Keys {
-        #[command(subcommand)]
-        action: KeysAction,
-    },
-    /// Show holdings and balance for a broker (read-only).
+    /// Manage trading accounts: store credentials (`add` / `toss`) or show holdings (`show`).
     Account {
-        #[arg(long)]
-        broker: String,
+        #[command(subcommand)]
+        action: AccountAction,
     },
     /// Fetch a current quote (read-only).
     Quote {
         ticker: String,
+        /// Account whose credentials to use, e.g. `kis-paper`.
+        #[arg(long)]
+        account: String,
         #[arg(long)]
         broker: String,
     },
@@ -121,9 +120,15 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum KeysAction {
-    /// Store 한국투자증권 (KIS) credentials.
-    Kis {
+enum AccountAction {
+    /// Store a 한국투자증권 (KIS) account (credentials + environment), keyed by name.
+    Add {
+        /// Account name, e.g. `kis-paper` | `kis-real`.
+        #[arg(long)]
+        name: String,
+        /// `paper` (모의) | `real` (실전).
+        #[arg(long, default_value = "paper")]
+        env: String,
         #[arg(long)]
         app_key: String,
         #[arg(long)]
@@ -132,19 +137,28 @@ enum KeysAction {
         cano: String,
         #[arg(long)]
         product_code: String,
-        #[arg(long, default_value = "paper")]
-        env: String,
         #[arg(long, default_value = "nasdaq")]
         exchange: String,
     },
-    /// Store 토스증권 (Toss) credentials.
+    /// Store a 토스증권 (Toss) account, keyed by name.
     Toss {
+        #[arg(long)]
+        name: String,
         #[arg(long)]
         app_key: String,
         #[arg(long)]
         app_secret: String,
         #[arg(long)]
         account_seq: i64,
+    },
+    /// Show holdings and balance for an account via a broker adapter (read-only).
+    Show {
+        /// Account name, e.g. `kis-real`.
+        #[arg(long)]
+        name: String,
+        /// Broker adapter: `kis` | `kis-domestic` | `toss`.
+        #[arg(long)]
+        broker: String,
     },
 }
 
@@ -154,6 +168,9 @@ enum StrategyAction {
     Add {
         #[arg(long)]
         name: String,
+        /// The account this position trades under, e.g. `kis-paper` (see `drip account add`).
+        #[arg(long)]
+        account: String,
         #[arg(long)]
         broker: String,
         #[arg(long)]
@@ -176,14 +193,31 @@ async fn main() -> Result<()> {
     let config_path = drip_infra::config_path()?;
     let state_path = drip_infra::state_path()?;
 
+    // Bring an existing pre-account home up to the account model (idempotent; backs up state.db
+    // before the ledger rewrite). A fresh or already-migrated home is left untouched.
+    let migration = drip_infra::migrate_to_accounts(&config_path, &secrets, &state_path)?;
+    if let Some(backup) = &migration.state_backup {
+        println!(
+            "Migrated the ledger to the account model (state.db backed up at {}).",
+            backup.display()
+        );
+    }
+    if !migration.accounts.is_empty() {
+        println!("Registered account(s): {}.", migration.accounts.join(", "));
+    }
+
     match cli.command {
         Command::Init => cmd_init()?,
-        Command::Keys { action } => cmd_keys(action, &secrets).await?,
-        Command::Account { broker } => cmd_account(&broker, &secrets).await?,
-        Command::Quote { ticker, broker } => cmd_quote(&ticker, &broker, &secrets).await?,
+        Command::Account { action } => cmd_account(action, &secrets, &config_path).await?,
+        Command::Quote {
+            ticker,
+            account,
+            broker,
+        } => cmd_quote(&ticker, &account, &broker, &secrets, &config_path).await?,
         Command::Strategy { action } => match action {
             StrategyAction::Add {
                 name,
+                account,
                 broker,
                 ticker,
                 seed,
@@ -193,6 +227,7 @@ async fn main() -> Result<()> {
                 cmd_strategy_add(
                     PositionConfig {
                         name,
+                        account,
                         broker,
                         ticker,
                         seed,
@@ -225,7 +260,7 @@ async fn main() -> Result<()> {
         Command::Run { execute, live } => {
             cmd_run(execute, live, &secrets, &config_path, state_path).await?
         }
-        Command::Status => cmd_status(state_path).await?,
+        Command::Status => cmd_status(state_path, &config_path).await?,
         Command::Web { addr } => drip_web::serve(addr).await?,
     }
     Ok(())
@@ -243,56 +278,126 @@ fn cmd_init() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_keys(action: KeysAction, secrets: &FileSecretStore) -> Result<()> {
+async fn cmd_account(
+    action: AccountAction,
+    secrets: &FileSecretStore,
+    config_path: &Path,
+) -> Result<()> {
     use drip_domain::SecretStore;
-    let broker = match action {
-        KeysAction::Kis {
+    match action {
+        AccountAction::Add {
+            name,
+            env,
             app_key,
             app_secret,
             cano,
             product_code,
-            env,
             exchange,
         } => {
+            validate_account_name(&name)?;
+            if env != "paper" && env != "real" {
+                return Err(anyhow!("env must be paper|real, got '{env}'"));
+            }
             drip_brokers::parse_exchange(&exchange)?; // validate before persisting
-            secrets.set("kis_app_key", &app_key)?;
-            secrets.set("kis_app_secret", &app_secret)?;
-            secrets.set("kis_cano", &cano)?;
-            secrets.set("kis_product_code", &product_code)?;
-            secrets.set("kis_env", &env)?;
-            secrets.set("kis_exchange", &exchange)?;
-            "kis"
+            for (field, value) in [
+                ("app_key", &app_key),
+                ("app_secret", &app_secret),
+                ("cano", &cano),
+                ("product_code", &product_code),
+                ("exchange", &exchange),
+            ] {
+                secrets.set(&AccountId::secret_key(&name, field), value)?;
+            }
+            register_account(config_path, &name, &env)?;
+            println!("Stored KIS account '{name}' ({env}).");
+            probe_account("kis", &name, &env, secrets).await;
         }
-        KeysAction::Toss {
+        AccountAction::Toss {
+            name,
             app_key,
             app_secret,
             account_seq,
         } => {
-            secrets.set("toss_app_key", &app_key)?;
-            secrets.set("toss_app_secret", &app_secret)?;
-            secrets.set("toss_account_seq", &account_seq.to_string())?;
-            "toss"
+            validate_account_name(&name)?;
+            secrets.set(&AccountId::secret_key(&name, "app_key"), &app_key)?;
+            secrets.set(&AccountId::secret_key(&name, "app_secret"), &app_secret)?;
+            secrets.set(
+                &AccountId::secret_key(&name, "account_seq"),
+                &account_seq.to_string(),
+            )?;
+            register_account(config_path, &name, "paper")?;
+            println!("Stored Toss account '{name}'.");
         }
-    };
-    println!("Stored {broker} credentials.");
-    match connect(broker, secrets, Some(drip_infra::drip_home()?.as_path())) {
+        AccountAction::Show { name, broker } => {
+            let env = AppConfig::load(config_path)?.env_for(&name);
+            let live = connect(
+                &broker,
+                &name,
+                &env,
+                secrets,
+                Some(drip_infra::drip_home()?.as_path()),
+            )?;
+            print_account(&account_snapshot(live.as_account()).await?);
+        }
+    }
+    Ok(())
+}
+
+/// Register (or update) an account in config, so positions can reference it by name and `status`
+/// can show its environment. Credentials stay in the secret store; only name + env live here.
+fn register_account(config_path: &Path, name: &str, env: &str) -> Result<()> {
+    let mut config = AppConfig::load(config_path)?;
+    config.upsert_account(AccountConfig {
+        name: name.to_string(),
+        env: env.to_string(),
+    });
+    config.save(config_path)?;
+    Ok(())
+}
+
+/// An account name becomes a secret-key prefix and a config key, so restrict it to `[a-z0-9-]` —
+/// notably no dots, which would nest in the secrets TOML and break the flat store.
+fn validate_account_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(anyhow!(
+            "account name '{name}' must be non-empty and use only a-z, 0-9, '-'"
+        ));
+    }
+    Ok(())
+}
+
+/// Best-effort credential probe: fetch one quote so a bad key surfaces at `account add` time, not
+/// on the first tick. Never fails the command — a probe error is only a warning.
+async fn probe_account(broker: &str, account: &str, env: &str, secrets: &FileSecretStore) {
+    let home = drip_infra::drip_home().ok();
+    match connect(broker, account, env, secrets, home.as_deref()) {
         Ok(live) => match fetch_quote(live.as_quotes(), &Ticker::new("AAPL")).await {
             Ok(quote) => println!("Validated: AAPL = {}", quote.price),
             Err(e) => println!("Warning: credential probe failed: {e}"),
         },
         Err(e) => println!("Warning: {e}"),
     }
-    Ok(())
 }
 
-async fn cmd_account(broker: &str, secrets: &FileSecretStore) -> Result<()> {
-    let live = connect(broker, secrets, Some(drip_infra::drip_home()?.as_path()))?;
-    print_account(&account_snapshot(live.as_account()).await?);
-    Ok(())
-}
-
-async fn cmd_quote(ticker: &str, broker: &str, secrets: &FileSecretStore) -> Result<()> {
-    let live = connect(broker, secrets, Some(drip_infra::drip_home()?.as_path()))?;
+async fn cmd_quote(
+    ticker: &str,
+    account: &str,
+    broker: &str,
+    secrets: &FileSecretStore,
+    config_path: &Path,
+) -> Result<()> {
+    let env = AppConfig::load(config_path)?.env_for(account);
+    let live = connect(
+        broker,
+        account,
+        &env,
+        secrets,
+        Some(drip_infra::drip_home()?.as_path()),
+    )?;
     let quote = fetch_quote(live.as_quotes(), &Ticker::new(ticker)).await?;
     println!(
         "{} {} = {} (as of {})",
@@ -307,6 +412,15 @@ async fn cmd_strategy_add(
     state_path: PathBuf,
 ) -> Result<()> {
     let mut config = AppConfig::load(config_path)?;
+    // Paper positions trade nothing live, so they need no registered account; for a live broker,
+    // warn if the named account has no stored credentials yet.
+    if position.broker != "paper" && config.find_account(&position.account).is_none() {
+        eprintln!(
+            "Warning: account '{}' is not configured — register it with \
+             `drip account add --name {} ...` before trading.",
+            position.account, position.account
+        );
+    }
     config.upsert(position.clone());
     config.save(config_path)?;
 
@@ -316,8 +430,13 @@ async fn cmd_strategy_add(
         .await?;
 
     println!(
-        "Added position '{}' ({} {} seed {} / {} splits).",
-        position.name, position.broker, position.ticker, position.seed, position.splits
+        "Added position '{}' (account {}, {} {}, seed {} / {} splits).",
+        position.name,
+        position.account,
+        position.broker,
+        position.ticker,
+        position.seed,
+        position.splits
     );
     Ok(())
 }
@@ -368,8 +487,11 @@ async fn cmd_dry_run(
     let position = config
         .find(name)
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
+    let env = config.env_for(&position.account);
     let live = connect(
         &position.broker,
+        &position.account,
+        &env,
         secrets,
         Some(drip_infra::drip_home()?.as_path()),
     )?;
@@ -415,8 +537,11 @@ async fn cmd_tick(
     // repeated ticks no longer over-buy. A real domestic account is still fenced downstream in
     // `place()` (a deliberate go-live step); `drip run` still skips domestic (its schedule is
     // US-Eastern-only — #22 P4).
+    let env = config.env_for(&position.account);
     let live_broker = connect(
         &position.broker,
+        &position.account,
+        &env,
         secrets,
         Some(drip_infra::drip_home()?.as_path()),
     )?;
@@ -468,8 +593,11 @@ async fn cmd_reconcile(
     let position = config
         .find(name)
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
+    let env = config.env_for(&position.account);
     let live = connect(
         &position.broker,
+        &position.account,
+        &env,
         secrets,
         Some(drip_infra::drip_home()?.as_path()),
     )?;
@@ -497,8 +625,11 @@ async fn cmd_fills(
     let position = config
         .find(name)
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
+    let env = config.env_for(&position.account);
     let live = connect(
         &position.broker,
+        &position.account,
+        &env,
         secrets,
         Some(drip_infra::drip_home()?.as_path()),
     )?;
@@ -576,8 +707,11 @@ async fn cmd_run(
             );
             continue;
         }
+        let env = config.env_for(&pc.account);
         let broker = connect(
             &pc.broker,
+            &pc.account,
+            &env,
             secrets,
             Some(drip_infra::drip_home()?.as_path()),
         )?;
@@ -654,24 +788,34 @@ async fn cmd_run(
     Ok(())
 }
 
-async fn cmd_status(state_path: PathBuf) -> Result<()> {
+async fn cmd_status(state_path: PathBuf, config_path: &Path) -> Result<()> {
     let repo = SqliteStateRepository::open(state_path)?;
     let positions = list_positions(&repo).await?;
     if positions.is_empty() {
         println!("No positions. Add one with `drip strategy add`.");
         return Ok(());
     }
+    let config = AppConfig::load(config_path)?;
     for p in &positions {
         let avg = p
             .avg_price
             .map(|x| x.to_string())
             .unwrap_or_else(|| "-".to_string());
+        // The account's environment is the loudest safety signal — make a 실전 row unmistakable.
+        let tag = match config
+            .find_account(p.account.as_str())
+            .map(|a| a.env.as_str())
+        {
+            Some("real") => "[REAL]",
+            Some("paper") => "[paper]",
+            _ => "[env?]",
+        };
+        let account = p.account.to_string();
+        let broker = p.broker.to_string();
+        let ticker = p.ticker.to_string();
         println!(
-            "{} {:8} T={:<5} avg={:>8} shares={:>6} cum={} realized={} cycle={}",
-            p.broker,
-            p.ticker,
+            "{account:12} {broker:5} {ticker:8} {tag:7} T={:<5} avg={avg:>8} shares={:>6} cum={} realized={} cycle={}",
             p.t(),
-            avg,
             p.shares,
             p.cum_spent,
             p.realized_pnl,

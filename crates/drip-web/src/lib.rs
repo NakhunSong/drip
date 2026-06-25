@@ -61,6 +61,7 @@ async fn api_status(State(s): State<Arc<AppState>>) -> Result<Json<Vec<Position>
 
 #[derive(Deserialize)]
 struct QuoteQuery {
+    account: String,
     broker: String,
     ticker: String,
 }
@@ -70,23 +71,38 @@ async fn api_quote(
     Query(q): Query<QuoteQuery>,
 ) -> Result<Json<Quote>, ApiError> {
     let secrets = FileSecretStore::new(s.secrets_path.clone());
-    let live = connect(&q.broker, &secrets, s.secrets_path.parent())?;
+    let env = AppConfig::load(&s.config_path)?.env_for(&q.account);
+    let live = connect(
+        &q.broker,
+        &q.account,
+        &env,
+        &secrets,
+        s.secrets_path.parent(),
+    )?;
     Ok(Json(
         drip_app::fetch_quote(live.as_quotes(), &Ticker::new(q.ticker)).await?,
     ))
 }
 
 #[derive(Deserialize)]
-struct BrokerQuery {
+struct AccountQuery {
+    account: String,
     broker: String,
 }
 
 async fn api_account(
     State(s): State<Arc<AppState>>,
-    Query(q): Query<BrokerQuery>,
+    Query(q): Query<AccountQuery>,
 ) -> Result<Json<AccountView>, ApiError> {
     let secrets = FileSecretStore::new(s.secrets_path.clone());
-    let live = connect(&q.broker, &secrets, s.secrets_path.parent())?;
+    let env = AppConfig::load(&s.config_path)?.env_for(&q.account);
+    let live = connect(
+        &q.broker,
+        &q.account,
+        &env,
+        &secrets,
+        s.secrets_path.parent(),
+    )?;
     Ok(Json(drip_app::account_snapshot(live.as_account()).await?))
 }
 
