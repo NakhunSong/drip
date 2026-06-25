@@ -200,6 +200,32 @@ journal, risk-vet) while isolating the market-specific surface; keeping `BrokerI
 state migration, with the config string carrying the overseas/domestic distinction where routing
 actually happens.
 
+### ADR-13: An account is the ledger / credential isolation namespace (paper vs real)
+**Context:** State was keyed `(broker, ticker)` and credentials lived in one global `kis_*` slot
+with a single `kis_env`. Switching to a real KIS account therefore reinterpreted *every* position,
+and a real order on a paper-traded ticker would inherit the paper ledger — and its `OrderJournal`
+key, the at-most-once over-buy guard. 모의 and 실전 are different money on different servers; they
+must not share state.
+**Decision:** A position's identity is `(account, ticker)`, where `AccountId` (a drip-domain
+newtype) is an opaque isolation namespace — e.g. `kis-paper`, `kis-real`, `toss`, `paper`. It
+scopes three things: the sqlite `positions` ledger (PK `(account, ticker)`), the `OrderJournal`
+client key (`{account}:{ticker}:{date}:{tag}`, so a paper placement never suppresses the real order
+for the same leg), and the credential store (`AccountId::secret_key` → `{account}_{field}`, the one
+owner of that format). The **broker** stays orthogonal: the *adapter* identity
+(`kis`/`kis-domestic`/`toss`/`paper`) that routes `connect`; an account's `env` (paper/real) is a
+config `[[accounts]]` field, parsed to `KisEnv` at the adapter boundary. An existing pre-account
+home migrates in place on startup via `drip_infra::migrate_to_accounts` (idempotent): it rebuilds
+the `positions` table keyed by account (SQLite can't alter a PK — it rebuilds under a temp name and
+renames, backing up `state.db` first), re-keys the order journal the same broker→account way,
+assigns each position a `kis-<env>` account from the old global setting, and moves `kis_*` secrets
+under the account prefix.
+**Rationale:** the contamination was fundamentally that environment was absent from *identity*.
+Making the account (not a bolted-on `env` flag) the namespace is general — it covers paper/real and
+any future multi-account case — while keeping the broker the wire/adapter concern it already was.
+Isolating the journal key as well as the ledger is what makes a real go-live safe: the over-buy
+guard now distinguishes 모의 from 실전. The migration is data-preserving and reversible (a backup),
+so upgrading an existing 모의 ledger risks no loss — verified end-to-end on a copy of the real home.
+
 ## Data flow: a backtest
 
 1. CLI loads the position config and builds the strategy via `StrategyRegistry`.
@@ -272,6 +298,10 @@ actually happens.
   KST trading date (P1), domestic reconcile via `inquire-daily-ccld` (P2), and 모의 placement
   enabled (P3; `drip fills` inspects raw executions). A real domestic account stays fenced in
   `place()`; `drip run` skips domestic (US-only schedule).
+- **Account isolation (paper/real, done):** positions keyed `(account, ticker)`; credentials,
+  config `env`, ledger, and order journal all account-namespaced (ADR-13), with an automatic,
+  idempotent migration of an existing home (state.db backed up first). `drip account add|toss|show`;
+  `drip status` shows the environment. The foundation for a safe real go-live.
 - **M3+ (next):** domestic `drip run` scheduling + a KRX holiday calendar (#22 P4) and a real
   domestic go-live (lift the `place()` fence); WebSocket quotes + realtime triggers
   (`OnTick`/`OnPriceCross`), Rhai user strategies, OS-keychain secrets, rate-limiting,

@@ -51,7 +51,7 @@ cargo build --release           # binary at target/release/drip
 drip init
 
 # Configure a position (paper broker needs no credentials)
-drip strategy add --name tqqq --broker paper --ticker TQQQ --seed 4000 --splits 40
+drip strategy add --name tqqq --account paper --broker paper --ticker TQQQ --seed 4000 --splits 40
 
 # Backtest over a CSV of daily bars (date,open,high,low,close)
 drip backtest --name tqqq --data examples/tqqq-sample.csv
@@ -62,25 +62,31 @@ drip status
 
 ### Connecting a live broker
 
-KIS supports **live order placement** — US overseas (M2.1) and 모의 KRX via `--broker
-kis-domestic` (#22, a real domestic account is refused). Toss is read-only.
+drip isolates each brokerage **account** — its credentials, its environment, and its ledger.
+For KIS, 모의 (`paper`) and 실전 (`real`) are **separate accounts** (e.g. `kis-paper`,
+`kis-real`): switching between them never reinterprets a position or crosses ledgers. KIS
+supports **live order placement** — US overseas (M2.1) and 모의 KRX via `--broker kis-domestic`
+(#22, a real domestic account is refused). Toss is read-only.
 
 ```bash
-# KIS — store credentials (validated with a probe quote) in ~/.drip/secrets.toml (0600)
-drip keys kis --app-key KEY --app-secret SECRET \
-  --cano 12345678 --product-code 01 --env paper --exchange nasdaq
+# Register a KIS account (creds → ~/.drip/secrets.toml 0600, validated with a probe quote).
+drip account add --name kis-paper --env paper \
+  --app-key KEY --app-secret SECRET --cano 12345678 --product-code 01 --exchange nasdaq
 
-drip account --broker kis           # holdings + balance (read-only)
-drip quote AAPL --broker kis         # current quote
-drip dry-run --name tqqq             # today's intended orders — NOT placed
+# Attach a position to that account.
+drip strategy add --name tqqq --account kis-paper --broker kis --ticker TQQQ --seed 4000 --splits 40
+
+drip account show --name kis-paper --broker kis     # holdings + balance (read-only)
+drip quote AAPL --account kis-paper --broker kis     # current quote
+drip dry-run --name tqqq                             # today's intended orders — NOT placed
 
 # Place today's infinite-buying orders. Dry-run by default; --execute actually sends.
 drip tick --name tqqq                # preview what would be placed (nothing sent)
 drip tick --name tqqq --execute      # place on a 모의(paper) account
-# A KIS *real* account additionally requires --live:
-#   drip tick --name tqqq --execute --live
+# A real account is a separate registration (e.g. `--name kis-real --env real`); a real order
+# additionally requires --live:  drip tick --name <real-position> --execute --live
 
-# After the US close, fold settled fills into the ledger so T advances (tick does this too).
+# After the close, fold settled fills into the ledger so T advances (tick does this too).
 drip reconcile --name tqqq
 
 # Run the scheduler daemon: place every configured position on its daily schedule, on US
@@ -88,26 +94,31 @@ drip reconcile --name tqqq
 drip run                             # Ctrl-C (or SIGTERM) stops it cleanly between fires.
 
 # Toss (read-only)
-drip keys toss --app-key KEY --app-secret SECRET --account-seq 7
-drip account --broker toss
+drip account toss --name toss --app-key KEY --app-secret SECRET --account-seq 7
+drip account show --name toss --broker toss
 ```
+
+> Upgrading from a pre-account drip? The first command migrates `~/.drip` automatically —
+> credentials move under their account, the ledger is re-keyed (state.db is backed up first),
+> and your existing positions are assigned a `kis-<env>` account from the old global setting.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
 | `drip init` | Create `~/.drip` and an empty config. |
-| `drip strategy add` | Add/update a configured position. |
+| `drip account add --name --env …` | Register a KIS account (credentials + 모의/실전), validated with a probe quote. |
+| `drip account toss --name …` | Register a 토스증권 (Toss) account. |
+| `drip account show --name --broker` | Show an account's holdings and balance (read-only). |
+| `drip strategy add --name --account --broker` | Add/update a position, attached to an account. |
 | `drip backtest` | Backtest a position over a CSV. |
-| `drip keys kis\|toss` | Store + validate broker credentials. |
-| `drip account --broker` | Show holdings and balance (read-only). |
-| `drip quote <t> --broker` | Fetch a current quote (read-only). |
+| `drip quote <t> --account --broker` | Fetch a current quote (read-only). |
 | `drip dry-run --name` | Compute today's orders from a live quote (placed: none). |
 | `drip tick --name [--execute] [--live]` | Compute and (with `--execute`) place today's orders on KIS. Dry-run by default; `--live` confirms a real account. |
 | `drip reconcile --name` | Fold settled KIS fills into the position's ledger (advances `T`). Read-only at the broker. |
 | `drip fills --name [--since]` | Print broker-reported executions (date, side, qty, price) for a position. Read-only; touches no ledger. |
 | `drip run [--execute] [--live]` | Scheduler daemon: fire every configured position on its daily schedule (US trading days), through the same guarded path as `tick`. Dry-run by default. |
-| `drip status` | Show persisted positions. |
+| `drip status` | Show persisted positions (account, environment `[REAL]`/`[paper]`, `T`, holdings). |
 | `drip web` | Serve the read-only web dashboard (axum). |
 
 ## Environment variables

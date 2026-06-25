@@ -412,7 +412,9 @@ async fn cmd_strategy_add(
     state_path: PathBuf,
 ) -> Result<()> {
     let mut config = AppConfig::load(config_path)?;
-    if config.find_account(&position.account).is_none() {
+    // Paper positions trade nothing live, so they need no registered account; for a live broker,
+    // warn if the named account has no stored credentials yet.
+    if position.broker != "paper" && config.find_account(&position.account).is_none() {
         eprintln!(
             "Warning: account '{}' is not configured — register it with \
              `drip account add --name {} ...` before trading.",
