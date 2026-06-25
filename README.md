@@ -17,8 +17,9 @@ leveraged ETFs (TQQQ, SOXL, …), and adding your own strategy is a first-class 
 - **Single static binary** — `cargo install` or a prebuilt release; no runtime, no Docker.
 - **Pluggable strategies** — a strategy is a pure function `(state, market) → orders`.
   Built-in 무한매수 v2.2; user strategies (sandboxed Rhai scripts) are the next milestone.
-- **Multi-broker** — capability-based adapters: KIS (REST, paper trading, US overseas, **live
-  order placement**), Toss (REST, read-only), and a Paper simulator.
+- **Multi-broker** — capability-based adapters: KIS overseas (REST, paper trading, US, **live
+  order placement**), KIS domestic (KRX, **모의 order placement**), Toss (REST, read-only), and a
+  Paper simulator.
 - **Backtesting** — replay daily bars (CSV) with the same fill rules as paper trading;
   reports equity curve, CAGR, and max drawdown.
 - **Web dashboard** — `drip web` serves a read-only dashboard (positions, quotes, backtests)
@@ -61,7 +62,8 @@ drip status
 
 ### Connecting a live broker
 
-KIS supports **live order placement** (M2.1); Toss is read-only.
+KIS supports **live order placement** — US overseas (M2.1) and 모의 KRX via `--broker
+kis-domestic` (#22, a real domestic account is refused). Toss is read-only.
 
 ```bash
 # KIS — store credentials (validated with a probe quote) in ~/.drip/secrets.toml (0600)
@@ -103,6 +105,7 @@ drip account --broker toss
 | `drip dry-run --name` | Compute today's orders from a live quote (placed: none). |
 | `drip tick --name [--execute] [--live]` | Compute and (with `--execute`) place today's orders on KIS. Dry-run by default; `--live` confirms a real account. |
 | `drip reconcile --name` | Fold settled KIS fills into the position's ledger (advances `T`). Read-only at the broker. |
+| `drip fills --name [--since]` | Print broker-reported executions (date, side, qty, price) for a position. Read-only; touches no ledger. |
 | `drip run [--execute] [--live]` | Scheduler daemon: fire every configured position on its daily schedule (US trading days), through the same guarded path as `tick`. Dry-run by default. |
 | `drip status` | Show persisted positions. |
 | `drip web` | Serve the read-only web dashboard (axum). |

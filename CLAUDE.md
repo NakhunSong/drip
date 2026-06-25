@@ -22,9 +22,11 @@ Dependency rule: everything points inward to `drip-domain`. Order of crates:
 
 - Ports live in `drip-domain/src/ports.rs`. Adapters implement them in outer crates.
 - Broker ports are segregated: `Quotes` / `AccountQuery` / `OrderGateway`. In M1 no live
-  broker implemented `OrderGateway` (read-only by type). **M2.1: `KisBroker` implements it
-  (live order placement); `TossBroker` must NOT (no 모의 sandbox → stays read-only).** Going
-  live is now guarded at *runtime*, not by the type system — see placement safety below.
+  broker implemented `OrderGateway` (read-only by type). **M2.1: `KisBroker` (US overseas)
+  implements it; #22: `KisDomesticBroker` (KRX) implements it too (모의 placement enabled; a
+  real domestic account is still fenced in `place()`). `TossBroker` must NOT (no 모의 sandbox →
+  stays read-only).** Going live is now guarded at *runtime*, not by the type system — see
+  placement safety below.
 
 ## Conventions
 
@@ -47,15 +49,18 @@ Dependency rule: everything points inward to `drip-domain`. Order of crates:
   idempotent. `place_orders` reconciles before deciding (in-memory for a preview, persisted on
   `--execute`); never decide on a stale `T`. A fill must never be silently dropped (under-count
   → over-buy): every drop path is an explicit error.
-  `fills_since` returns fills in chronological order (`apply_day` needs it).
-- **Trading calendar & scheduler (M2.3)** — `drip_domain::calendar` is the single source of the
-  US **Eastern** trading date (DST-aware) and NYSE holidays; the CLI, the scheduler, and the KIS
-  adapter all key off it (a market calendar is market knowledge, not a broker's). The idempotency
-  key and the reconcile boundary use the Eastern date, not UTC, so an after-hours rerun never
-  double-places. `drip run` (a drip-cli driving adapter) fires each position through
-  `place_orders` on its `Schedule`, on trading days only; the scheduling logic
-  (`next_fire`/`is_due`) is pure domain and the engine loop is thin async glue. Don't add a
-  live-trading path outside `place_orders`.
+  `fills_since` returns fills in chronological order (`apply_day` needs it) — overseas KIS reads
+  `inquire-ccnl`, domestic KIS reads `inquire-daily-ccld` (per-fill price = total amount ÷ qty).
+- **Trading calendar & scheduler (M2.3; market-aware date #22)** — `drip_domain::calendar` owns
+  the **trading date**, which is market-aware: `trading_date(market, now)` → KST for KRX (UTC+9,
+  no DST) and US **Eastern** for US equities (DST-aware). The CLI + the KIS adapters key the
+  idempotency key and the reconcile boundary off it (not UTC), so an after-hours rerun never
+  double-places (a market calendar is market knowledge, not a broker's). **Only the *date* is
+  market-aware** — the **NYSE holiday set and the `drip run` scheduler remain US-only**: `drip
+  run` fires US positions through `place_orders` on NYSE trading days and **skips domestic** (KRX
+  holidays + domestic scheduling are P4, #22). The scheduling logic (`next_fire`/`is_due`) is
+  pure domain and the engine loop is thin async glue. Don't add a live-trading path outside
+  `place_orders`.
 - Errors map to `DomainError` at adapter boundaries. The CLI uses `anyhow` at the top.
 - Secrets: `FileSecretStore` (`~/.drip/secrets.toml`, `0600`). Never log secret values.
   Secret keys use underscores (`kis_app_key`), never dots (dots are TOML nesting).
@@ -74,7 +79,7 @@ Dependency rule: everything points inward to `drip-domain`. Order of crates:
 ```
 crates/drip-domain      # value objects, entities, ports, settle()
 crates/drip-strategies  # InfiniteBuying v2.2 + registry
-crates/drip-brokers     # KisBroker, TossBroker, PaperBroker (+ shared http.rs)
+crates/drip-brokers     # KisBroker (US), KisDomesticBroker (KRX), TossBroker, PaperBroker (+ shared http.rs)
 crates/drip-app         # use cases (backtest, account, quote, dry-run, tick) shared by cli+web
 crates/drip-infra       # config, secrets, sqlite state, csv data, logging
 crates/drip-cli         # clap commands + composition root (binary `drip`)
@@ -105,12 +110,21 @@ docs/                   # M2 engine design sketch
   `drip run` fires every configured position through `place_orders` on a daily `Schedule`, on
   NYSE trading days, with per-position error isolation, trading-window catch-up, and graceful
   shutdown — issue #4. `drip tick` stays the one-shot path.
+- **Domestic KRX (#22, done):** the KIS **domestic** adapter (`KisDomesticBroker`, `--broker
+  kis-domestic`) — Phase 0 read-only (quote/holdings/balance) + Phase 1 placement (지정가 limit
+  at the leg price, rounded to the KRX ETF tick). P1: the trading date is market-aware (KST for
+  KRX, no DST) so an intraday rerun never double-places. P2: domestic reconcile via
+  `inquire-daily-ccld` (per-fill price = total amount ÷ qty). P3: 모의 placement enabled
+  (`drip tick --execute`; `drip fills` prints raw executions). **A real domestic account stays
+  fenced** in `place()` (a deliberate go-live); `drip run` **skips domestic** (US-only schedule).
 - **Still out of scope (M3+):** WebSocket quotes / realtime triggers (`OnTick`/`OnPriceCross`),
   Rhai strategies, OS-keychain secrets, rate-limiting, notifications, Toss order placement (no
-  모의 sandbox). Any further live-trading change is a production-safety change — surface it.
+  모의 sandbox), **domestic `drip run` scheduling + KRX holiday calendar (#22 P4)**, and a
+  **real** domestic go-live (lift the `place()` fence). Any further live-trading change is a
+  production-safety change — surface it.
 
 ## Definition of done
 
 `cargo test` green · `clippy -D warnings` clean · `cargo fmt --check` clean · no `f64` for
-money · only `KisBroker` implements `OrderGateway` (Toss stays read-only) · every placement
-path stays behind `place_orders`' guards · docs updated when conventions change.
+money · only `KisBroker` + `KisDomesticBroker` implement `OrderGateway` (Toss stays read-only) ·
+every placement path stays behind `place_orders`' guards · docs updated when conventions change.
