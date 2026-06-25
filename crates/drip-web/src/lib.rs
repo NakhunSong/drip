@@ -61,6 +61,7 @@ async fn api_status(State(s): State<Arc<AppState>>) -> Result<Json<Vec<Position>
 
 #[derive(Deserialize)]
 struct QuoteQuery {
+    account: String,
     broker: String,
     ticker: String,
 }
@@ -70,24 +71,48 @@ async fn api_quote(
     Query(q): Query<QuoteQuery>,
 ) -> Result<Json<Quote>, ApiError> {
     let secrets = FileSecretStore::new(s.secrets_path.clone());
-    let live = connect(&q.broker, &secrets, s.secrets_path.parent())?;
+    let env = account_env(&s.config_path, &q.account)?;
+    let live = connect(
+        &q.broker,
+        &q.account,
+        &env,
+        &secrets,
+        s.secrets_path.parent(),
+    )?;
     Ok(Json(
         drip_app::fetch_quote(live.as_quotes(), &Ticker::new(q.ticker)).await?,
     ))
 }
 
 #[derive(Deserialize)]
-struct BrokerQuery {
+struct AccountQuery {
+    account: String,
     broker: String,
 }
 
 async fn api_account(
     State(s): State<Arc<AppState>>,
-    Query(q): Query<BrokerQuery>,
+    Query(q): Query<AccountQuery>,
 ) -> Result<Json<AccountView>, ApiError> {
     let secrets = FileSecretStore::new(s.secrets_path.clone());
-    let live = connect(&q.broker, &secrets, s.secrets_path.parent())?;
+    let env = account_env(&s.config_path, &q.account)?;
+    let live = connect(
+        &q.broker,
+        &q.account,
+        &env,
+        &secrets,
+        s.secrets_path.parent(),
+    )?;
     Ok(Json(drip_app::account_snapshot(live.as_account()).await?))
+}
+
+/// The configured environment (`paper`|`real`) for `account`, defaulting to `paper` when the
+/// account isn't registered — needed to build the account-scoped broker connection.
+fn account_env(config_path: &std::path::Path, account: &str) -> Result<String, ApiError> {
+    Ok(AppConfig::load(config_path)?
+        .find_account(account)
+        .map(|a| a.env.clone())
+        .unwrap_or_else(|| "paper".to_string()))
 }
 
 #[derive(Deserialize)]

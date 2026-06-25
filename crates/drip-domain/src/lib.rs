@@ -16,7 +16,7 @@ pub mod schedule;
 pub mod settlement;
 
 pub use error::{DomainError, Result};
-pub use market::{Bar, BrokerId, MarketSnapshot, OrderId, Quote, Side, Ticker};
+pub use market::{AccountId, Bar, BrokerId, MarketSnapshot, OrderId, Quote, Side, Ticker};
 pub use money::{Money, Percent, Price, Shares};
 pub use order::{OrderIntent, OrderKind};
 pub use ports::{

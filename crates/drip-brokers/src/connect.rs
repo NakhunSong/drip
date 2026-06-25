@@ -43,59 +43,65 @@ impl LiveBroker {
     }
 }
 
-/// Build a live broker by name (`kis` | `toss`) from stored secrets. `cache_dir` (the drip home)
-/// is where KIS persists its OAuth token and rate-limit timestamp across processes; `None` keeps
-/// them in-memory only.
+/// Build a live broker adapter for `account` from its stored secrets. `account` is the credential
+/// namespace (secrets are keyed `{account}_{field}`) and `env` (`paper` | `real`, from the
+/// account's config) selects the KIS server; `broker` (`kis` | `kis-domestic` | `toss`) picks the
+/// adapter. `cache_dir` (the drip home) is where KIS persists its OAuth token and rate-limit
+/// timestamp across processes; `None` keeps them in-memory only.
 pub fn connect(
     broker: &str,
+    account: &str,
+    env: &str,
     secrets: &dyn SecretStore,
     cache_dir: Option<&Path>,
 ) -> Result<LiveBroker> {
     match broker {
         "kis" => Ok(LiveBroker::Kis(KisBroker::new(
-            kis_config(secrets)?,
+            kis_config(secrets, account, env)?,
             cache_dir,
         )?)),
         "kis-domestic" => Ok(LiveBroker::KisDomestic(KisDomesticBroker::new(
-            kis_config(secrets)?,
+            kis_config(secrets, account, env)?,
             cache_dir,
         )?)),
         "toss" => {
-            let account_seq = require(secrets, "toss_account_seq")?.parse().map_err(|e| {
-                DomainError::Config(format!("toss_account_seq must be an integer: {e}"))
-            })?;
+            let account_seq = require(secrets, account, "account_seq")?
+                .parse()
+                .map_err(|e| {
+                    DomainError::Config(format!("{account}_account_seq must be an integer: {e}"))
+                })?;
             let config = TossConfig {
-                app_key: require(secrets, "toss_app_key")?,
-                app_secret: require(secrets, "toss_app_secret")?,
+                app_key: require(secrets, account, "app_key")?,
+                app_secret: require(secrets, account, "app_secret")?,
                 account_seq,
             };
             Ok(LiveBroker::Toss(TossBroker::new(config)?))
         }
         other => Err(DomainError::Config(format!(
-            "broker '{other}' has no live adapter (use kis|toss)"
+            "broker '{other}' has no live adapter (use kis|kis-domestic|toss)"
         ))),
     }
 }
 
-/// Build a [`KisConfig`] from the stored `kis_*` secrets — shared by the overseas (`kis`) and
-/// domestic (`kis-domestic`) adapters, which use the same account and app key.
-fn kis_config(secrets: &dyn SecretStore) -> Result<KisConfig> {
-    let environment = match require(secrets, "kis_env")?.as_str() {
+/// Build a [`KisConfig`] from `account`'s stored secrets and its `env` — shared by the overseas
+/// (`kis`) and domestic (`kis-domestic`) adapters, which use the same account credentials.
+fn kis_config(secrets: &dyn SecretStore, account: &str, env: &str) -> Result<KisConfig> {
+    let environment = match env {
         "real" => KisEnv::Real,
         "paper" => KisEnv::Paper,
         other => {
             return Err(DomainError::Config(format!(
-                "kis_env must be real|paper, got '{other}'"
+                "account '{account}' env must be real|paper, got '{other}'"
             )));
         }
     };
     Ok(KisConfig {
         environment,
-        app_key: require(secrets, "kis_app_key")?,
-        app_secret: require(secrets, "kis_app_secret")?,
-        cano: require(secrets, "kis_cano")?,
-        product_code: require(secrets, "kis_product_code")?,
-        exchange: parse_exchange(&require(secrets, "kis_exchange")?)?,
+        app_key: require(secrets, account, "app_key")?,
+        app_secret: require(secrets, account, "app_secret")?,
+        cano: require(secrets, account, "cano")?,
+        product_code: require(secrets, account, "product_code")?,
+        exchange: parse_exchange(&require(secrets, account, "exchange")?)?,
     })
 }
 
@@ -111,9 +117,13 @@ pub fn parse_exchange(raw: &str) -> Result<KisExchange> {
     }
 }
 
-fn require(secrets: &dyn SecretStore, key: &str) -> Result<String> {
-    secrets.get(key)?.ok_or_else(|| {
-        DomainError::Config(format!("missing secret '{key}' — run `drip keys` first"))
+/// Fetch a required account-scoped secret, keyed `{account}_{field}`.
+fn require(secrets: &dyn SecretStore, account: &str, field: &str) -> Result<String> {
+    let key = format!("{account}_{field}");
+    secrets.get(&key)?.ok_or_else(|| {
+        DomainError::Config(format!(
+            "missing secret '{key}' — run `drip account add` first"
+        ))
     })
 }
 
@@ -139,28 +149,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn connect_kis_requires_all_secrets() {
-        let secrets = MapSecrets::default();
-        assert!(connect("kis", &secrets, None).is_err()); // nothing stored yet
-        for (k, v) in [
-            ("kis_env", "paper"),
-            ("kis_app_key", "k"),
-            ("kis_app_secret", "s"),
-            ("kis_cano", "12345678"),
-            ("kis_product_code", "01"),
-            ("kis_exchange", "nasdaq"),
+    fn seed_kis(secrets: &MapSecrets, account: &str) {
+        for (field, v) in [
+            ("app_key", "k"),
+            ("app_secret", "s"),
+            ("cano", "12345678"),
+            ("product_code", "01"),
+            ("exchange", "nasdaq"),
         ] {
-            secrets.set(k, v).unwrap();
+            secrets.set(&format!("{account}_{field}"), v).unwrap();
         }
+    }
+
+    #[test]
+    fn connect_kis_requires_all_account_secrets() {
+        let secrets = MapSecrets::default();
+        assert!(connect("kis", "kis-paper", "paper", &secrets, None).is_err()); // nothing stored
+        seed_kis(&secrets, "kis-paper");
         assert!(matches!(
-            connect("kis", &secrets, None).unwrap(),
+            connect("kis", "kis-paper", "paper", &secrets, None).unwrap(),
             LiveBroker::Kis(_)
         ));
     }
 
     #[test]
+    fn connect_resolves_creds_by_account_not_broker() {
+        // Two KIS accounts hold different credentials under their own prefixes; `connect` reads
+        // the one named, so 모의 and 실전 never cross. Distinct exchanges prove which was read.
+        let secrets = MapSecrets::default();
+        seed_kis(&secrets, "kis-paper");
+        secrets.set("kis-real_app_key", "real").unwrap();
+        secrets.set("kis-real_app_secret", "rs").unwrap();
+        secrets.set("kis-real_cano", "99999999").unwrap();
+        secrets.set("kis-real_product_code", "01").unwrap();
+        secrets.set("kis-real_exchange", "nyse").unwrap();
+        assert!(matches!(
+            connect("kis-domestic", "kis-real", "real", &secrets, None).unwrap(),
+            LiveBroker::KisDomestic(_)
+        ));
+        // The paper account's creds alone don't satisfy a real-account connect on another name.
+        assert!(connect("kis", "kis-missing", "real", &secrets, None).is_err());
+    }
+
+    #[test]
+    fn connect_kis_rejects_a_bad_env() {
+        let secrets = MapSecrets::default();
+        seed_kis(&secrets, "kis-paper");
+        assert!(connect("kis", "kis-paper", "vts", &secrets, None).is_err());
+    }
+
+    #[test]
     fn unknown_broker_is_an_error() {
-        assert!(connect("nope", &MapSecrets::default(), None).is_err());
+        assert!(connect("nope", "any", "paper", &MapSecrets::default(), None).is_err());
     }
 }

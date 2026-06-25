@@ -1,7 +1,7 @@
 //! Broker-neutral order intents — what a strategy *wants* done, before any broker
 //! translates it into a wire-format order.
 
-use crate::market::{BrokerId, Side, Ticker};
+use crate::market::{AccountId, Side, Ticker};
 use crate::money::{Price, Shares};
 use serde::Serialize;
 use time::Date;
@@ -69,7 +69,39 @@ impl OrderIntent {
     /// where each of `loc_low`/`loc_high`/`tp_rest`/`tp_quarter`/`quarter_stop` appears at
     /// most once. Re-running `drip tick` the same day reproduces identical keys, which the
     /// [`crate::OrderJournal`] uses to guarantee at-most-once placement.
-    pub fn client_key(&self, broker: BrokerId, ticker: &Ticker, date: Date) -> String {
-        format!("{broker}:{ticker}:{date}:{}", self.tag)
+    ///
+    /// Keyed by [`AccountId`], not broker: 모의 and 실전 are different accounts on the same
+    /// broker and ticker, so a paper order must not suppress the real order for the same leg
+    /// (and vice versa). The account namespace keeps their keys distinct.
+    pub fn client_key(&self, account: &AccountId, ticker: &Ticker, date: Date) -> String {
+        format!("{account}:{ticker}:{date}:{}", self.tag)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::money::{Price, Shares};
+    use rust_decimal_macros::dec;
+    use time::macros::date;
+
+    #[test]
+    fn client_key_is_scoped_by_account() {
+        let intent = OrderIntent::loc(
+            Side::Buy,
+            Shares::new(1),
+            Price::new(dec!(188.475)).unwrap(),
+            "loc_low",
+        );
+        let ticker = Ticker::new("122630");
+        let day = date!(2026 - 06 - 25);
+        let paper = intent.client_key(&AccountId::new("kis-paper"), &ticker, day);
+        let real = intent.client_key(&AccountId::new("kis-real"), &ticker, day);
+        // Different accounts on the same broker / ticker / day / leg → different keys, so a 모의
+        // placement never suppresses the 실전 order for the same leg (read as "already placed"),
+        // nor the reverse. This is the over-buy guard's twin for the paper/real boundary.
+        assert_ne!(paper, real);
+        assert_eq!(paper, "kis-paper:122630:2026-06-25:loc_low");
+        assert_eq!(real, "kis-real:122630:2026-06-25:loc_low");
     }
 }

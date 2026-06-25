@@ -147,7 +147,7 @@ fn cagr(initial: Money, final_equity: Money, start: Date, end: Date) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use drip_domain::BrokerId;
+    use drip_domain::{AccountId, BrokerId};
     use drip_strategies::{InfiniteBuying, InfiniteBuyingConfig};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -166,7 +166,13 @@ mod tests {
         }
     }
     fn position(seed: Decimal) -> Position {
-        Position::new(BrokerId::Paper, Ticker::new("TQQQ"), Money::new(seed), 40)
+        Position::new(
+            AccountId::new("paper"),
+            BrokerId::Paper,
+            Ticker::new("TQQQ"),
+            Money::new(seed),
+            40,
+        )
     }
     fn strat() -> InfiniteBuying {
         InfiniteBuying::new(InfiniteBuyingConfig::default())

@@ -1,23 +1,42 @@
 //! Application configuration: the set of configured positions, persisted as TOML. Secrets
 //! (API keys) live separately in the secret store, never in this file.
 
-use drip_domain::{BrokerId, DomainError, Money, Position, Result, Ticker};
+use drip_domain::{AccountId, BrokerId, DomainError, Money, Position, Result, Ticker};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// The accounts positions trade under — each a credential + environment bundle. Credentials
+    /// live in the secret store (keyed `{account}_{field}`); only the non-secret name/env are here.
+    #[serde(default)]
+    pub accounts: Vec<AccountConfig>,
     #[serde(default)]
     pub positions: Vec<PositionConfig>,
 }
 
-/// One configured position: which strategy trades which ticker on which broker.
+/// One trading account: a named (environment, credentials) bundle. For KIS the `env` separates
+/// 모의 (`paper`) from 실전 (`real`); it is ignored for brokers without that distinction.
+/// Credentials are not stored here — they live in the secret store under `{name}_{field}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountConfig {
+    /// Unique account name, e.g. `kis-paper` | `kis-real` | `toss`.
+    pub name: String,
+    /// `paper` | `real` (KIS only; ignored otherwise).
+    pub env: String,
+}
+
+/// One configured position: which strategy trades which ticker, on which account + broker adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionConfig {
     /// Unique name, e.g. `tqqq-kis`.
     pub name: String,
-    /// Broker key: `kis` | `toss` | `paper`.
+    /// The account (credentials + environment) this position trades under, e.g. `kis-paper`.
+    /// `#[serde(default)]` keeps pre-account configs loadable; [`crate::migrate`] fills it in.
+    #[serde(default)]
+    pub account: String,
+    /// Broker adapter key: `kis` | `kis-domestic` | `toss` | `paper`.
     pub broker: String,
     pub ticker: String,
     pub seed: Decimal,
@@ -39,6 +58,7 @@ impl PositionConfig {
     pub fn to_position(&self) -> Result<Position> {
         let broker: BrokerId = self.broker.parse()?;
         Ok(Position::new(
+            AccountId::new(&self.account),
             broker,
             Ticker::new(&self.ticker),
             Money::new(self.seed),
@@ -81,11 +101,24 @@ impl AppConfig {
         self.positions.iter().find(|p| p.name == name)
     }
 
+    /// Look up a configured account by name (its environment + credential namespace).
+    pub fn find_account(&self, name: &str) -> Option<&AccountConfig> {
+        self.accounts.iter().find(|a| a.name == name)
+    }
+
     /// Insert a position, replacing any existing one with the same name.
     pub fn upsert(&mut self, position: PositionConfig) {
         match self.positions.iter_mut().find(|p| p.name == position.name) {
             Some(existing) => *existing = position,
             None => self.positions.push(position),
+        }
+    }
+
+    /// Insert an account, replacing any existing one with the same name.
+    pub fn upsert_account(&mut self, account: AccountConfig) {
+        match self.accounts.iter_mut().find(|a| a.name == account.name) {
+            Some(existing) => *existing = account,
+            None => self.accounts.push(account),
         }
     }
 }
@@ -98,8 +131,13 @@ mod tests {
     #[test]
     fn round_trips_through_toml() {
         let mut config = AppConfig::default();
+        config.upsert_account(AccountConfig {
+            name: "kis-paper".into(),
+            env: "paper".into(),
+        });
         config.upsert(PositionConfig {
             name: "tqqq-kis".into(),
+            account: "kis-paper".into(),
             broker: "kis".into(),
             ticker: "TQQQ".into(),
             seed: dec!(4000),
@@ -111,6 +149,8 @@ mod tests {
         let parsed: AppConfig = toml::from_str(&text).unwrap();
         assert_eq!(parsed.positions.len(), 1);
         assert_eq!(parsed.find("tqqq-kis").unwrap().seed, dec!(4000));
+        assert_eq!(parsed.find("tqqq-kis").unwrap().account, "kis-paper");
+        assert_eq!(parsed.find_account("kis-paper").unwrap().env, "paper");
     }
 
     #[test]
@@ -118,6 +158,7 @@ mod tests {
         let mut config = AppConfig::default();
         let mut p = PositionConfig {
             name: "x".into(),
+            account: "paper".into(),
             broker: "paper".into(),
             ticker: "TQQQ".into(),
             seed: dec!(1000),

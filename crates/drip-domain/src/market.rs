@@ -24,6 +24,29 @@ impl fmt::Display for Ticker {
     }
 }
 
+/// Which configured account a position trades under — the isolation namespace for its ledger,
+/// its order-journal keys, and its stored credentials. For KIS this separates 모의 from 실전
+/// (e.g. `kis-paper` vs `kis-real`): different accounts, different money. Keeping it in the
+/// state and journal keys is what stops a real position from inheriting a paper ledger, or a
+/// paper order key from suppressing the real order on the same ticker. The broker (adapter) is
+/// orthogonal — one account can trade both the overseas and the domestic KIS adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct AccountId(String);
+
+impl AccountId {
+    pub fn new(name: impl Into<String>) -> AccountId {
+        AccountId(name.into().trim().to_string())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for AccountId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Which broker an order or position belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

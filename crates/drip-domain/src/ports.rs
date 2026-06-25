@@ -9,7 +9,7 @@
 //! order yet. That is how "read-only live integration" is guaranteed by the compiler.
 
 use crate::error::Result;
-use crate::market::{Bar, BrokerId, MarketSnapshot, OrderId, Quote, Ticker};
+use crate::market::{AccountId, Bar, BrokerId, MarketSnapshot, OrderId, Quote, Ticker};
 use crate::money::Money;
 use crate::order::OrderIntent;
 use crate::position::{Fill, Holding, Position};
@@ -107,10 +107,12 @@ pub trait MarketDataSource: Send + Sync {
     async fn bars(&self, ticker: &Ticker, from: Date, to: Date) -> Result<Vec<Bar>>;
 }
 
-/// Persistence for positions across runs. Implemented by sqlite in `drip-infra`.
+/// Persistence for positions across runs. Implemented by sqlite in `drip-infra`. Positions are
+/// keyed by `(account, ticker)`: the account is the isolation namespace (see [`AccountId`]), so a
+/// real position never shares a ledger row with a paper one on the same ticker.
 #[async_trait]
 pub trait StateRepository: Send + Sync {
-    async fn load(&self, broker: BrokerId, ticker: &Ticker) -> Result<Option<Position>>;
+    async fn load(&self, account: &AccountId, ticker: &Ticker) -> Result<Option<Position>>;
     async fn save(&self, position: &Position) -> Result<()>;
     async fn list(&self) -> Result<Vec<Position>>;
 }

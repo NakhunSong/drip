@@ -171,7 +171,7 @@ impl Strategy for InfiniteBuying {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use drip_domain::{BrokerId, MarketSnapshot, Money, Shares, Ticker};
+    use drip_domain::{AccountId, BrokerId, MarketSnapshot, Money, Shares, Ticker};
     use time::macros::date;
 
     const SEED: Decimal = dec!(32000); // budget = 32000 / 40 = 800
@@ -181,7 +181,13 @@ mod tests {
     }
 
     fn flat() -> Position {
-        Position::new(BrokerId::Paper, Ticker::new("TQQQ"), Money::new(SEED), 40)
+        Position::new(
+            AccountId::new("paper"),
+            BrokerId::Paper,
+            Ticker::new("TQQQ"),
+            Money::new(SEED),
+            40,
+        )
     }
 
     fn holding(avg: Decimal, shares: u32, cum_spent: Decimal) -> Position {

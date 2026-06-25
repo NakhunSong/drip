@@ -76,12 +76,13 @@ pub fn vet(intent: &OrderIntent, position: &Position, reference: Price) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::market::{BrokerId, Ticker};
+    use crate::market::{AccountId, BrokerId, Ticker};
     use crate::money::{Money, Shares};
 
     fn position() -> Position {
         // seed 32000 / 40 = 800 daily budget; 10 shares held at avg 100.
         let mut p = Position::new(
+            AccountId::new("kis-paper"),
             BrokerId::Kis,
             Ticker::new("TQQQ"),
             Money::new(dec!(32000)),

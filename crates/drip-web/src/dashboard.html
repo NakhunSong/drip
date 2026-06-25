@@ -25,15 +25,16 @@
     <h2>Positions</h2>
     <button onclick="loadStatus()">Refresh</button>
     <table id="positions"><thead><tr>
-      <th>broker</th><th>ticker</th><th>T</th><th>avg</th><th>shares</th><th>realized</th><th>cycle</th>
+      <th>account</th><th>broker</th><th>ticker</th><th>T</th><th>avg</th><th>shares</th><th>realized</th><th>cycle</th>
     </tr></thead><tbody></tbody></table>
   </section>
 
   <section>
     <h2>Quote / Account <span class="muted">(read-only)</span></h2>
     <div class="row">
-      <input id="broker" value="kis" size="6" />
-      <input id="ticker" value="TQQQ" size="8" />
+      <input id="account" value="kis-paper" size="10" placeholder="account" />
+      <input id="broker" value="kis" size="6" placeholder="broker" />
+      <input id="ticker" value="TQQQ" size="8" placeholder="ticker" />
       <button onclick="getQuote()">Quote</button>
       <button onclick="getAccount()">Account</button>
     </div>
@@ -59,24 +60,25 @@
     };
     async function loadStatus() {
       const tbody = document.querySelector('#positions tbody');
-      tbody.innerHTML = '<tr><td colspan=7 class=muted>loading…</td></tr>';
+      tbody.innerHTML = '<tr><td colspan=8 class=muted>loading…</td></tr>';
       try {
         const rows = await j('/api/status');
         tbody.innerHTML = rows.length ? rows.map(p => `<tr>
-          <td>${p.broker}</td><td>${p.ticker}</td><td>${p.cum_spent}</td>
+          <td>${p.account}</td><td>${p.broker}</td><td>${p.ticker}</td><td>${p.cum_spent}</td>
           <td>${p.avg_price ?? '-'}</td><td>${p.shares}</td><td>${p.realized_pnl}</td><td>${p.cycle_index}</td>
-        </tr>`).join('') : '<tr><td colspan=7 class=muted>no positions — add one with `drip strategy add`</td></tr>';
-      } catch (e) { tbody.innerHTML = `<tr><td colspan=7>error: ${e.message}</td></tr>`; }
+        </tr>`).join('') : '<tr><td colspan=8 class=muted>no positions — add one with `drip strategy add`</td></tr>';
+      } catch (e) { tbody.innerHTML = `<tr><td colspan=8>error: ${e.message}</td></tr>`; }
     }
     const show = (id, v) => document.getElementById(id).textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+    const account = () => document.getElementById('account').value.trim();
     const broker = () => document.getElementById('broker').value.trim();
     const ticker = () => document.getElementById('ticker').value.trim();
     async function getQuote() {
-      try { show('brokerOut', await j(`/api/quote?broker=${broker()}&ticker=${ticker()}`)); }
+      try { show('brokerOut', await j(`/api/quote?account=${account()}&broker=${broker()}&ticker=${ticker()}`)); }
       catch (e) { show('brokerOut', 'error: ' + e.message); }
     }
     async function getAccount() {
-      try { show('brokerOut', await j(`/api/account?broker=${broker()}`)); }
+      try { show('brokerOut', await j(`/api/account?account=${account()}&broker=${broker()}`)); }
       catch (e) { show('brokerOut', 'error: ' + e.message); }
     }
     async function runBacktest() {
