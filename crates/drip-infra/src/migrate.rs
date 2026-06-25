@@ -110,8 +110,11 @@ fn migrate_state(state_path: &Path, env: &str) -> Result<Option<PathBuf>> {
         let mut position: Position = serde_json::from_str(&data).map_err(storage_err)?;
         position.account = AccountId::new(account_for(&broker, env));
         let data = serde_json::to_string(&position).map_err(storage_err)?;
+        // Plain INSERT (not OR REPLACE): the broker→account mapping can't collide two source rows
+        // onto one (account, ticker) today, but if that ever changed this fails loud rather than
+        // silently dropping a ledger row.
         conn.execute(
-            "INSERT OR REPLACE INTO positions_new (account, ticker, data) VALUES (?1, ?2, ?3)",
+            "INSERT INTO positions_new (account, ticker, data) VALUES (?1, ?2, ?3)",
             (position.account.as_str(), position.ticker.as_str(), data),
         )
         .map_err(storage_err)?;
@@ -123,7 +126,51 @@ fn migrate_state(state_path: &Path, env: &str) -> Result<Option<PathBuf>> {
     )
     .map_err(storage_err)?;
 
+    rekey_order_journal(&conn, env)?;
     Ok(Some(backup))
+}
+
+/// Re-prefix `order_journal` client keys from broker- to account-namespaced, the same mapping the
+/// positions re-key uses. A client key is `{prefix}:ticker:date:tag`; the prefix was the broker
+/// (`kis`/`toss`/`paper`) and is now the account. Without this, a same-day re-tick across the
+/// upgrade would compute an account-prefixed key that the broker-prefixed journal doesn't hold,
+/// re-reserve it, and place the order again — an over-buy. Idempotent: an already-account prefix
+/// maps to itself, so re-running changes nothing.
+fn rekey_order_journal(conn: &Connection, env: &str) -> Result<()> {
+    if !table_exists(conn, "order_journal")? {
+        return Ok(()); // pre-M2 db, or none placed yet — nothing to re-key
+    }
+    let keys: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT client_key FROM order_journal")
+            .map_err(storage_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_err)?
+    };
+    for key in keys {
+        if let Some((prefix, rest)) = key.split_once(':') {
+            let account = account_for(prefix, env);
+            if account != prefix {
+                conn.execute(
+                    "UPDATE order_journal SET client_key = ?1 WHERE client_key = ?2",
+                    (format!("{account}:{rest}"), &key),
+                )
+                .map_err(storage_err)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a table exists in the database.
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
+        .map_err(storage_err)?
+        .exists([name])
+        .map_err(storage_err)
 }
 
 /// Whether the `positions` table is the pre-account schema (a `broker` column, no `account`). A
@@ -275,6 +322,26 @@ mod tests {
             [data],
         )
         .unwrap();
+        // A legacy order_journal with a broker-prefixed client key, as the pre-account binary wrote.
+        conn.execute(
+            "CREATE TABLE order_journal (client_key TEXT PRIMARY KEY, order_id TEXT, at INTEGER NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO order_journal (client_key, at) VALUES ('kis:122630:2026-06-24:loc_low', 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn journal_keys(state_path: &Path) -> Vec<String> {
+        let conn = Connection::open(state_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT client_key FROM order_journal")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
     }
 
     #[tokio::test]
@@ -316,6 +383,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still, Some(kodex));
+    }
+
+    #[test]
+    fn migration_rekeys_the_order_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let state_path = dir.path().join("state.db");
+        write_legacy_state(&state_path);
+        let secrets = MapSecrets::default();
+        seed_legacy_kis(&secrets, "paper");
+
+        migrate_to_accounts(&config_path, &secrets, &state_path).unwrap();
+        // The broker-prefixed reservation is re-keyed to the account, so a same-day re-tick across
+        // the upgrade finds it and won't double-place (the over-buy guard, preserved through the
+        // schema change).
+        assert_eq!(
+            journal_keys(&state_path),
+            vec!["kis-paper:122630:2026-06-24:loc_low".to_string()]
+        );
+
+        // Idempotent: a second migration leaves the already-account-keyed entry untouched.
+        migrate_to_accounts(&config_path, &secrets, &state_path).unwrap();
+        assert_eq!(
+            journal_keys(&state_path),
+            vec!["kis-paper:122630:2026-06-24:loc_low".to_string()]
+        );
     }
 
     #[test]

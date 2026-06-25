@@ -294,6 +294,7 @@ async fn cmd_account(
             product_code,
             exchange,
         } => {
+            validate_account_name(&name)?;
             if env != "paper" && env != "real" {
                 return Err(anyhow!("env must be paper|real, got '{env}'"));
             }
@@ -317,6 +318,7 @@ async fn cmd_account(
             app_secret,
             account_seq,
         } => {
+            validate_account_name(&name)?;
             secrets.set(&AccountId::secret_key(&name, "app_key"), &app_key)?;
             secrets.set(&AccountId::secret_key(&name, "app_secret"), &app_secret)?;
             secrets.set(
@@ -350,6 +352,21 @@ fn register_account(config_path: &Path, name: &str, env: &str) -> Result<()> {
         env: env.to_string(),
     });
     config.save(config_path)?;
+    Ok(())
+}
+
+/// An account name becomes a secret-key prefix and a config key, so restrict it to `[a-z0-9-]` —
+/// notably no dots, which would nest in the secrets TOML and break the flat store.
+fn validate_account_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(anyhow!(
+            "account name '{name}' must be non-empty and use only a-z, 0-9, '-'"
+        ));
+    }
     Ok(())
 }
 
