@@ -91,6 +91,16 @@ enum Command {
         #[arg(long)]
         name: String,
     },
+    /// Show the broker's reported executions (fills) for a position — a read-only diagnostic for
+    /// reconcile (what `fills_since` sees). Never places.
+    Fills {
+        #[arg(long)]
+        name: String,
+        /// Only fills on/after this date (YYYY-MM-DD). Defaults to the reconcile watermark, else
+        /// ~90 days back (the 모의 inquiry window).
+        #[arg(long)]
+        since: Option<String>,
+    },
     /// Run the scheduler daemon: fire every configured position on its schedule, on US trading
     /// days. Dry-run by default; `--execute` places orders, `--live` allows a real account.
     Run {
@@ -211,6 +221,7 @@ async fn main() -> Result<()> {
         Command::Reconcile { name } => {
             cmd_reconcile(&name, &secrets, &config_path, state_path).await?
         }
+        Command::Fills { name, since } => cmd_fills(&name, since, &secrets, &config_path).await?,
         Command::Run { execute, live } => {
             cmd_run(execute, live, &secrets, &config_path, state_path).await?
         }
@@ -399,19 +410,11 @@ async fn cmd_tick(
     let position = config
         .find(name)
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
-    if execute && position.broker == "kis-domestic" {
-        // Domestic live placement is gated (the daemon already skips it). drip keys the
-        // at-most-once order key off the US-Eastern date, which rolls over mid-KRX-session
-        // (~13:00 KST) → an intraday rerun could double-place; and domestic fill-reconcile is
-        // unimplemented, so repeated ticks never advance `T` and would over-buy. Both are fixed by
-        // #22 (a KST trading calendar + domestic reconcile). A preview (no `--execute`) is fine.
-        return Err(anyhow!(
-            "domestic (kis-domestic) live placement is gated until #22: the at-most-once order key \
-             uses the US-Eastern date (rolls over mid-KRX-session → intraday double-place) and \
-             domestic fill-reconcile is unimplemented (→ cross-day over-buy). Preview without \
-             `--execute` works."
-        ));
-    }
+    // Domestic 모의 placement is enabled: the KST trading date (#22 P1) removes the
+    // intraday-double-place hazard and `inquire-daily-ccld` reconcile (#22 P2) advances `T`, so
+    // repeated ticks no longer over-buy. A real domestic account is still fenced downstream in
+    // `place()` (a deliberate go-live step); `drip run` still skips domestic (its schedule is
+    // US-Eastern-only — #22 P4).
     let live_broker = connect(
         &position.broker,
         secrets,
@@ -479,6 +482,53 @@ async fn cmd_reconcile(
     );
     let view = reconcile(live.as_account(), &repo, position.to_position()?, today).await?;
     print_reconcile(name, &view);
+    Ok(())
+}
+
+/// `drip fills` — print the broker's reported executions for a position via `fills_since`. A
+/// read-only diagnostic (never places, never writes state) for inspecting what reconcile sees.
+async fn cmd_fills(
+    name: &str,
+    since: Option<String>,
+    secrets: &FileSecretStore,
+    config_path: &Path,
+) -> Result<()> {
+    let config = AppConfig::load(config_path)?;
+    let position = config
+        .find(name)
+        .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
+    let live = connect(
+        &position.broker,
+        secrets,
+        Some(drip_infra::drip_home()?.as_path()),
+    )?;
+    let today = trading_date(
+        position_market(&position.broker),
+        time::OffsetDateTime::now_utc(),
+    );
+    // Default to the reconcile watermark, else the broker's inquiry window (~90 days back).
+    let since = match since {
+        Some(raw) => parse_date(&raw)?,
+        None => position
+            .to_position()?
+            .reconciled_through
+            .unwrap_or(today - time::Duration::days(90)),
+    };
+    let ticker = Ticker::new(&position.ticker);
+    let fills = live.as_account().fills_since(&ticker, since).await?;
+    println!(
+        "Fills {name} ({ticker}) since {since}: {} fill(s)",
+        fills.len()
+    );
+    for fill in &fills {
+        println!(
+            "  {} {:?} {} @ {}",
+            fill.at,
+            fill.side,
+            fill.shares.get(),
+            fill.price.value()
+        );
+    }
     Ok(())
 }
 
