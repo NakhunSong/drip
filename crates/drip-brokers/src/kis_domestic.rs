@@ -9,28 +9,27 @@
 //! (`domestic_stock/{inquire_price, inquire_balance, order_cash, inquire_daily_ccld}`).
 //!
 //! The account, app key/secret, OAuth token, and per-second rate limiter are **shared with the
-//! overseas [`KisBroker`]**: same app key → same on-disk token and rate-limit files (the cache
-//! filename helper and `base_url` are reused from [`crate::kis`]), so the domestic and overseas
-//! adapters coordinate token issuance and request spacing across processes exactly as a single
-//! KIS app key requires (KIS issues ~1 token/min and throttles per second per app key).
+//! overseas [`KisBroker`]** via the common [`crate::kis_session::KisSession`]: same app key → same
+//! on-disk token and rate-limit files, so the domestic and overseas adapters coordinate token
+//! issuance and request spacing across processes exactly as a single KIS app key requires (KIS
+//! issues ~1 token/min and throttles per second per app key).
 
 use crate::http::{
-    RateLimitStore, RateLimiter, TokenCache, TokenStore, broker_err, parse_decimal,
-    parse_price_opt, parse_shares, parse_yyyymmdd, send_with_retry, today_utc, yyyymmdd,
+    broker_err, parse_decimal, parse_price_opt, parse_shares, parse_yyyymmdd, today_utc, yyyymmdd,
 };
-use crate::kis::{KisConfig, KisEnv, kis_cache_filename};
+use crate::kis::{KisConfig, KisEnv};
+use crate::kis_session::{KisSession, check_rt};
 use async_trait::async_trait;
 use drip_domain::calendar::{Market, trading_date};
 use drip_domain::{
     AccountQuery, BrokerId, BrokerInfo, Capabilities, DomainError, Fill, Holding, Money,
     OrderGateway, OrderId, OrderIntent, Price, Quote, Quotes, Result, Side, Ticker,
 };
+use reqwest::Method;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
 
 /// A KIS adapter for domestic (KRX) Korean stocks. Reuses [`KisConfig`] — the domestic and
 /// overseas adapters share one account and one app key; `KisConfig.exchange` is a US-exchange
@@ -38,12 +37,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct KisDomesticBroker {
     config: KisConfig,
-    base: String,
-    client: reqwest::Client,
-    tokens: TokenCache,
-    limiter: Arc<RateLimiter>,
-    /// Base backoff between transient-5xx retries (exponential); zero in tests.
-    retry_backoff: Duration,
+    session: KisSession,
 }
 
 impl KisDomesticBroker {
@@ -52,69 +46,10 @@ impl KisDomesticBroker {
     /// only (tests). The cache filenames and base URL are the same as the overseas adapter for the
     /// same app key, so a single token and a single rate-limit clock are shared between them.
     pub fn new(config: KisConfig, cache_dir: Option<&Path>) -> Result<KisDomesticBroker> {
-        let base = config.environment.base_url().to_string();
-        let client = reqwest::Client::builder().build().map_err(broker_err)?;
-        // KIS throttles per second; 모의 strictly (≈1/s), 실전 ≈20/s. Space every request under the
-        // limit so multi-call commands never trip EGW00201.
-        let interval = match config.environment {
-            KisEnv::Paper => Duration::from_millis(1100),
-            KisEnv::Real => Duration::from_millis(60),
-        };
-        // Disk-backed caches under the drip home, keyed identically to the overseas adapter so the
-        // token and the rate-limit timestamp are shared across both adapters and across processes.
-        // Memory-only when no dir is provided.
-        let (tokens, limiter_store) = match cache_dir {
-            Some(dir) => (
-                TokenCache::with_store(TokenStore::new(
-                    dir.join(kis_cache_filename(&config, "token")),
-                )),
-                Some(RateLimitStore::new(
-                    dir.join(kis_cache_filename(&config, "ratelimit")),
-                )),
-            ),
-            None => (TokenCache::new(), None),
-        };
         Ok(KisDomesticBroker {
+            session: KisSession::new(&config, cache_dir)?,
             config,
-            base,
-            client,
-            tokens,
-            limiter: Arc::new(RateLimiter::new(interval, limiter_store)),
-            retry_backoff: Duration::from_millis(250),
         })
-    }
-
-    async fn token(&self) -> Result<String> {
-        let base = self.base.clone();
-        let app_key = self.config.app_key.clone();
-        let app_secret = self.config.app_secret.clone();
-        let client = self.client.clone();
-        let limiter = self.limiter.clone();
-        self.tokens
-            .get_or_refresh(move || async move {
-                limiter.acquire().await;
-                let body = json!({
-                    "grant_type": "client_credentials",
-                    "appkey": app_key,
-                    "appsecret": app_secret,
-                });
-                let token: KisToken = client
-                    .post(format!("{base}/oauth2/tokenP"))
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(broker_err)?
-                    .error_for_status()
-                    .map_err(broker_err)?
-                    .json()
-                    .await
-                    .map_err(broker_err)?;
-                Ok((
-                    token.access_token,
-                    Duration::from_secs(token.expires_in.saturating_sub(60)),
-                ))
-            })
-            .await
     }
 
     /// The balance-inquiry `tr_id` differs by environment (`T*` real, `V*` paper).
@@ -126,42 +61,33 @@ impl KisDomesticBroker {
     }
 
     async fn fetch_balance(&self) -> Result<KisBalanceResp> {
-        let token = self.token().await?;
-        let body: KisBalanceResp = send_with_retry(&self.limiter, self.retry_backoff, || {
-            self.client
-                .get(format!(
-                    "{}/uapi/domestic-stock/v1/trading/inquire-balance",
-                    self.base
-                ))
-                .header("authorization", format!("Bearer {token}"))
-                .header("appkey", &self.config.app_key)
-                .header("appsecret", &self.config.app_secret)
-                .header("tr_id", self.balance_tr_id())
-                .header("custtype", "P")
-                .query(&[
-                    ("CANO", self.config.cano.as_str()),
-                    ("ACNT_PRDT_CD", self.config.product_code.as_str()),
-                    ("AFHR_FLPR_YN", "N"),
-                    ("OFL_YN", ""),
-                    ("INQR_DVSN", "02"),
-                    ("UNPR_DVSN", "01"),
-                    ("FUND_STTL_ICLD_YN", "N"),
-                    ("FNCG_AMT_AUTO_RDPT_YN", "N"),
-                    ("PRCS_DVSN", "00"),
-                    ("CTX_AREA_FK100", ""),
-                    ("CTX_AREA_NK100", ""),
-                ])
-        })
-        .await?
-        .json()
-        .await
-        .map_err(broker_err)?;
-        if body.rt_cd != "0" {
-            return Err(DomainError::Broker(format!(
-                "KIS domestic balance rt_cd={} {}",
-                body.rt_cd, body.msg1
-            )));
-        }
+        let token = self.session.token().await?;
+        let body: KisBalanceResp = self
+            .session
+            .send_with_retry_json(|| {
+                self.session
+                    .authed(
+                        Method::GET,
+                        "/uapi/domestic-stock/v1/trading/inquire-balance",
+                        self.balance_tr_id(),
+                        &token,
+                    )
+                    .query(&[
+                        ("CANO", self.config.cano.as_str()),
+                        ("ACNT_PRDT_CD", self.config.product_code.as_str()),
+                        ("AFHR_FLPR_YN", "N"),
+                        ("OFL_YN", ""),
+                        ("INQR_DVSN", "02"),
+                        ("UNPR_DVSN", "01"),
+                        ("FUND_STTL_ICLD_YN", "N"),
+                        ("FNCG_AMT_AUTO_RDPT_YN", "N"),
+                        ("PRCS_DVSN", "00"),
+                        ("CTX_AREA_FK100", ""),
+                        ("CTX_AREA_NK100", ""),
+                    ])
+            })
+            .await?;
+        check_rt("domestic balance", &body.rt_cd, &body.msg1)?;
         Ok(body)
     }
 
@@ -201,33 +127,24 @@ impl BrokerInfo for KisDomesticBroker {
 #[async_trait]
 impl Quotes for KisDomesticBroker {
     async fn quote(&self, ticker: &Ticker) -> Result<Quote> {
-        let token = self.token().await?;
-        let body: KisQuoteResp = send_with_retry(&self.limiter, self.retry_backoff, || {
-            self.client
-                .get(format!(
-                    "{}/uapi/domestic-stock/v1/quotations/inquire-price",
-                    self.base
-                ))
-                .header("authorization", format!("Bearer {token}"))
-                .header("appkey", &self.config.app_key)
-                .header("appsecret", &self.config.app_secret)
-                .header("tr_id", "FHKST01010100")
-                .header("custtype", "P")
-                .query(&[
-                    ("FID_COND_MRKT_DIV_CODE", "J"),
-                    ("FID_INPUT_ISCD", ticker.as_str()),
-                ])
-        })
-        .await?
-        .json()
-        .await
-        .map_err(broker_err)?;
-        if body.rt_cd != "0" {
-            return Err(DomainError::Broker(format!(
-                "KIS domestic quote rt_cd={} {}",
-                body.rt_cd, body.msg1
-            )));
-        }
+        let token = self.session.token().await?;
+        let body: KisQuoteResp = self
+            .session
+            .send_with_retry_json(|| {
+                self.session
+                    .authed(
+                        Method::GET,
+                        "/uapi/domestic-stock/v1/quotations/inquire-price",
+                        "FHKST01010100",
+                        &token,
+                    )
+                    .query(&[
+                        ("FID_COND_MRKT_DIV_CODE", "J"),
+                        ("FID_INPUT_ISCD", ticker.as_str()),
+                    ])
+            })
+            .await?;
+        check_rt("domestic quote", &body.rt_cd, &body.msg1)?;
         let price = parse_price_opt(&body.output.stck_prpr)?
             .ok_or_else(|| DomainError::Broker(format!("KIS returned no price for {ticker}")))?;
         Ok(Quote {
@@ -273,7 +190,7 @@ impl AccountQuery for KisDomesticBroker {
     }
 
     async fn fills_since(&self, ticker: &Ticker, since: time::Date) -> Result<Vec<Fill>> {
-        let token = self.token().await?;
+        let token = self.session.token().await?;
         // Query range in the KRX (KST) calendar — the same trading date the order key and the
         // reconcile boundary use (#22 P1), and the one `ord_dt` is reported in, so the
         // "completed days < today" comparison stays apples-to-apples. Clamp a corrupt/future
@@ -293,57 +210,46 @@ impl AccountQuery for KisDomesticBroker {
         let mut fills = Vec::new();
         let (mut fk, mut nk, mut tr_cont) = (String::new(), String::new(), String::new());
         for _ in 0..MAX_DAILY_CCLD_PAGES {
-            // NOT wrapped in `send_with_retry`: this read accumulates fills across pages and the
-            // reconcile path folds each without de-duping by execution id, so a re-returned page
-            // would over-count → over-buy. A transient 5xx aborts the tick instead (the next fire
-            // retries on a fresh, un-advanced ledger). Single-shot reads (quote, balance) do retry.
-            self.limiter.acquire().await;
+            // `send_once` (no retry): this paginated read accumulates fills, and reconcile folds
+            // each without de-duping by execution id, so a re-returned page would over-count →
+            // over-buy. See `KisSession::send_once`.
             let resp = self
-                .client
-                .get(format!(
-                    "{}/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
-                    self.base
-                ))
-                .header("authorization", format!("Bearer {token}"))
-                .header("appkey", &self.config.app_key)
-                .header("appsecret", &self.config.app_secret)
-                .header("tr_id", self.daily_ccld_tr_id())
-                .header("custtype", "P")
-                .header("tr_cont", tr_cont.as_str())
-                .query(&[
-                    ("CANO", self.config.cano.as_str()),
-                    ("ACNT_PRDT_CD", self.config.product_code.as_str()),
-                    ("INQR_STRT_DT", start.as_str()),
-                    ("INQR_END_DT", end.as_str()),
-                    ("SLL_BUY_DVSN_CD", "00"),
-                    ("INQR_DVSN", "01"),
-                    ("PDNO", pdno_param),
-                    ("CCLD_DVSN", "01"),
-                    ("ORD_GNO_BRNO", ""),
-                    ("ODNO", ""),
-                    ("INQR_DVSN_3", "00"),
-                    ("INQR_DVSN_1", ""),
-                    ("EXCG_ID_DVSN_CD", "KRX"),
-                    ("CTX_AREA_FK100", fk.as_str()),
-                    ("CTX_AREA_NK100", nk.as_str()),
-                ])
-                .send()
-                .await
-                .map_err(broker_err)?
-                .error_for_status()
-                .map_err(broker_err)?;
+                .session
+                .send_once(
+                    self.session
+                        .authed(
+                            Method::GET,
+                            "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                            self.daily_ccld_tr_id(),
+                            &token,
+                        )
+                        .header("tr_cont", tr_cont.as_str())
+                        .query(&[
+                            ("CANO", self.config.cano.as_str()),
+                            ("ACNT_PRDT_CD", self.config.product_code.as_str()),
+                            ("INQR_STRT_DT", start.as_str()),
+                            ("INQR_END_DT", end.as_str()),
+                            ("SLL_BUY_DVSN_CD", "00"),
+                            ("INQR_DVSN", "01"),
+                            ("PDNO", pdno_param),
+                            ("CCLD_DVSN", "01"),
+                            ("ORD_GNO_BRNO", ""),
+                            ("ODNO", ""),
+                            ("INQR_DVSN_3", "00"),
+                            ("INQR_DVSN_1", ""),
+                            ("EXCG_ID_DVSN_CD", "KRX"),
+                            ("CTX_AREA_FK100", fk.as_str()),
+                            ("CTX_AREA_NK100", nk.as_str()),
+                        ]),
+                )
+                .await?;
             // The continuation flag is a response *header*: `M`/`F` mean more pages follow.
             let more = matches!(
                 resp.headers().get("tr_cont").and_then(|v| v.to_str().ok()),
                 Some("M") | Some("F")
             );
             let body: KisDailyCcldResp = resp.json().await.map_err(broker_err)?;
-            if body.rt_cd != "0" {
-                return Err(DomainError::Broker(format!(
-                    "KIS domestic inquire-daily-ccld rt_cd={} {}",
-                    body.rt_cd, body.msg1
-                )));
-            }
+            check_rt("domestic inquire-daily-ccld", &body.rt_cd, &body.msg1)?;
             for row in &body.output1 {
                 // Skip other tickers (a paper query returns the whole account) and any row with
                 // nothing filled.
@@ -428,7 +334,7 @@ impl OrderGateway for KisDomesticBroker {
         // price, rounded to the KRX **ETF** tick (5원 ≥2,000원 / 1원 below — the 무한매수법 targets
         // leveraged ETFs; common-stock tick bands are #22). KIS 모의 has no true LOC, so this is a
         // day-limit at that price (the same degrade the overseas adapter makes), not close-only.
-        let token = self.token().await?;
+        let token = self.session.token().await?;
         let limit = order.limit.ok_or_else(|| {
             DomainError::Broker("domestic placement requires a limit price".into())
         })?;
@@ -442,35 +348,25 @@ impl OrderGateway for KisDomesticBroker {
             "ORD_UNPR": unit_price.normalize().to_string(),
             "EXCG_ID_DVSN_CD": "KRX",
         });
-        // Not wrapped in `send_with_retry`: an order is a write; KIS assigns its own order number
-        // with no client idempotency key, so a retried submission could double-place (see #20).
-        self.limiter.acquire().await;
+        // `send_once` (no retry): an order is a write with no client idempotency key, so a retry
+        // could double-place (#20). See `KisSession::send_once`.
         let resp: KisOrderResp = self
-            .client
-            .post(format!(
-                "{}/uapi/domestic-stock/v1/trading/order-cash",
-                self.base
-            ))
-            .header("authorization", format!("Bearer {token}"))
-            .header("appkey", &self.config.app_key)
-            .header("appsecret", &self.config.app_secret)
-            .header("tr_id", self.order_tr_id(order.side))
-            .header("custtype", "P")
-            .json(&body)
-            .send()
-            .await
-            .map_err(broker_err)?
-            .error_for_status()
-            .map_err(broker_err)?
+            .session
+            .send_once(
+                self.session
+                    .authed(
+                        Method::POST,
+                        "/uapi/domestic-stock/v1/trading/order-cash",
+                        self.order_tr_id(order.side),
+                        &token,
+                    )
+                    .json(&body),
+            )
+            .await?
             .json()
             .await
             .map_err(broker_err)?;
-        if resp.rt_cd != "0" {
-            return Err(DomainError::Broker(format!(
-                "KIS domestic order rt_cd={} {}",
-                resp.rt_cd, resp.msg1
-            )));
-        }
+        check_rt("domestic order", &resp.rt_cd, &resp.msg1)?;
         let odno = resp.output.odno.trim();
         if odno.is_empty() {
             return Err(DomainError::Broker(
@@ -491,13 +387,6 @@ impl OrderGateway for KisDomesticBroker {
             "domestic KIS order cancellation is not implemented".into(),
         ))
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct KisToken {
-    access_token: String,
-    #[serde(default)]
-    expires_in: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -623,13 +512,10 @@ mod tests {
     }
 
     fn broker(base: String) -> KisDomesticBroker {
+        let config = config();
         KisDomesticBroker {
-            config: config(),
-            base,
-            client: reqwest::Client::new(),
-            tokens: TokenCache::new(),
-            limiter: Arc::new(RateLimiter::new(Duration::ZERO, None)),
-            retry_backoff: Duration::ZERO,
+            session: KisSession::for_test(&config, base),
+            config,
         }
     }
 
@@ -780,16 +666,13 @@ mod tests {
     async fn place_refuses_a_real_account() {
         // Domestic placement is 모의-only until execution-history reconcile (#22); a real account
         // must be refused before any network call (no order is ever sent).
+        let config = KisConfig {
+            environment: KisEnv::Real,
+            ..config()
+        };
         let broker = KisDomesticBroker {
-            config: KisConfig {
-                environment: KisEnv::Real,
-                ..config()
-            },
-            base: "http://unused.invalid".into(),
-            client: reqwest::Client::new(),
-            tokens: TokenCache::new(),
-            limiter: Arc::new(RateLimiter::new(Duration::ZERO, None)),
-            retry_backoff: Duration::ZERO,
+            session: KisSession::for_test(&config, "http://unused.invalid".into()),
+            config,
         };
         let intent = OrderIntent::loc(
             Side::Buy,
