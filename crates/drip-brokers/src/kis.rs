@@ -15,19 +15,18 @@
 //! hit a 403. Realtime (WebSocket) quotes and order cancellation are later enhancements.
 
 use crate::http::{
-    RateLimitStore, RateLimiter, TokenCache, TokenStore, broker_err, parse_decimal,
-    parse_price_opt, parse_shares, parse_yyyymmdd, send_with_retry, today_utc, yyyymmdd,
+    broker_err, parse_decimal, parse_price_opt, parse_shares, parse_yyyymmdd, today_utc, yyyymmdd,
 };
+use crate::kis_session::{KisSession, check_rt};
 use async_trait::async_trait;
 use drip_domain::{
     AccountQuery, BrokerId, BrokerInfo, Capabilities, DomainError, Fill, Holding, Money,
     OrderGateway, OrderId, OrderIntent, OrderKind, Quote, Quotes, Result, Side, Ticker,
 };
+use reqwest::Method;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
 
 /// KIS environment: real trading vs the paper-trading (VTS) server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,130 +118,42 @@ pub struct KisConfig {
 #[derive(Debug)]
 pub struct KisBroker {
     config: KisConfig,
-    base: String,
-    client: reqwest::Client,
-    tokens: TokenCache,
-    limiter: Arc<RateLimiter>,
-    /// Base backoff between transient-5xx retries (exponential); zero in tests.
-    retry_backoff: Duration,
-}
-
-/// Filename for a KIS instance's per-`kind` cache file (`kind` = `"token"` | `"ratelimit"`):
-/// environment plus a hash of the app key, so 모의/실전 and rotated keys never reuse each other's
-/// file. (The hash only discriminates the file; if it changes across toolchains the old file is
-/// just orphaned.)
-pub(crate) fn kis_cache_filename(config: &KisConfig, kind: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    config.app_key.hash(&mut hasher);
-    let env = match config.environment {
-        KisEnv::Paper => "paper",
-        KisEnv::Real => "real",
-    };
-    format!("{kind}-kis-{env}-{:016x}.json", hasher.finish())
+    session: KisSession,
 }
 
 impl KisBroker {
     /// Build a KIS adapter. `cache_dir` (the drip home) enables the on-disk caches for the OAuth
     /// token and the cross-process rate-limit timestamp; `None` keeps both in-memory only (tests).
     pub fn new(config: KisConfig, cache_dir: Option<&Path>) -> Result<KisBroker> {
-        let base = config.environment.base_url().to_string();
-        let client = reqwest::Client::builder().build().map_err(broker_err)?;
-        // KIS throttles per second; 모의 strictly (≈1/s), 실전 ≈20/s. Space every request under
-        // the limit so multi-call commands (tick / account) never trip EGW00201.
-        let interval = match config.environment {
-            KisEnv::Paper => Duration::from_millis(1100),
-            KisEnv::Real => Duration::from_millis(60),
-        };
-        // Disk-backed caches under the drip home so the token and the rate-limit timestamp survive
-        // across processes (KIS issues ~1 token/min, and throttles per second, per app key).
-        // Memory-only when no dir is provided.
-        let (tokens, limiter_store) = match cache_dir {
-            Some(dir) => (
-                TokenCache::with_store(TokenStore::new(
-                    dir.join(kis_cache_filename(&config, "token")),
-                )),
-                Some(RateLimitStore::new(
-                    dir.join(kis_cache_filename(&config, "ratelimit")),
-                )),
-            ),
-            None => (TokenCache::new(), None),
-        };
         Ok(KisBroker {
+            session: KisSession::new(&config, cache_dir)?,
             config,
-            base,
-            client,
-            tokens,
-            limiter: Arc::new(RateLimiter::new(interval, limiter_store)),
-            retry_backoff: Duration::from_millis(250),
         })
-    }
-
-    async fn token(&self) -> Result<String> {
-        let base = self.base.clone();
-        let app_key = self.config.app_key.clone();
-        let app_secret = self.config.app_secret.clone();
-        let client = self.client.clone();
-        let limiter = self.limiter.clone();
-        self.tokens
-            .get_or_refresh(move || async move {
-                limiter.acquire().await;
-                let body = json!({
-                    "grant_type": "client_credentials",
-                    "appkey": app_key,
-                    "appsecret": app_secret,
-                });
-                let token: KisToken = client
-                    .post(format!("{base}/oauth2/tokenP"))
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(broker_err)?
-                    .error_for_status()
-                    .map_err(broker_err)?
-                    .json()
-                    .await
-                    .map_err(broker_err)?;
-                Ok((
-                    token.access_token,
-                    Duration::from_secs(token.expires_in.saturating_sub(60)),
-                ))
-            })
-            .await
     }
 
     async fn fetch_balance(&self) -> Result<KisBalanceResp> {
-        let token = self.token().await?;
-        let body: KisBalanceResp = send_with_retry(&self.limiter, self.retry_backoff, || {
-            self.client
-                .get(format!(
-                    "{}/uapi/overseas-stock/v1/trading/inquire-balance",
-                    self.base
-                ))
-                .header("authorization", format!("Bearer {token}"))
-                .header("appkey", &self.config.app_key)
-                .header("appsecret", &self.config.app_secret)
-                .header("tr_id", self.config.environment.balance_tr_id())
-                .header("custtype", "P")
-                .query(&[
-                    ("CANO", self.config.cano.as_str()),
-                    ("ACNT_PRDT_CD", self.config.product_code.as_str()),
-                    ("OVRS_EXCG_CD", self.config.exchange.excg_code_4()),
-                    ("TR_CRCY_CD", "USD"),
-                    ("CTX_AREA_FK200", ""),
-                    ("CTX_AREA_NK200", ""),
-                ])
-        })
-        .await?
-        .json()
-        .await
-        .map_err(broker_err)?;
-        if body.rt_cd != "0" {
-            return Err(DomainError::Broker(format!(
-                "KIS balance rt_cd={} {}",
-                body.rt_cd, body.msg1
-            )));
-        }
+        let token = self.session.token().await?;
+        let body: KisBalanceResp = self
+            .session
+            .send_with_retry_json(|| {
+                self.session
+                    .authed(
+                        Method::GET,
+                        "/uapi/overseas-stock/v1/trading/inquire-balance",
+                        self.config.environment.balance_tr_id(),
+                        &token,
+                    )
+                    .query(&[
+                        ("CANO", self.config.cano.as_str()),
+                        ("ACNT_PRDT_CD", self.config.product_code.as_str()),
+                        ("OVRS_EXCG_CD", self.config.exchange.excg_code_4()),
+                        ("TR_CRCY_CD", "USD"),
+                        ("CTX_AREA_FK200", ""),
+                        ("CTX_AREA_NK200", ""),
+                    ])
+            })
+            .await?;
+        check_rt("balance", &body.rt_cd, &body.msg1)?;
         Ok(body)
     }
 
@@ -282,34 +193,25 @@ impl BrokerInfo for KisBroker {
 #[async_trait]
 impl Quotes for KisBroker {
     async fn quote(&self, ticker: &Ticker) -> Result<Quote> {
-        let token = self.token().await?;
-        let body: KisQuoteResp = send_with_retry(&self.limiter, self.retry_backoff, || {
-            self.client
-                .get(format!(
-                    "{}/uapi/overseas-price/v1/quotations/price",
-                    self.base
-                ))
-                .header("authorization", format!("Bearer {token}"))
-                .header("appkey", &self.config.app_key)
-                .header("appsecret", &self.config.app_secret)
-                .header("tr_id", "HHDFS00000300")
-                .header("custtype", "P")
-                .query(&[
-                    ("AUTH", ""),
-                    ("EXCD", self.config.exchange.quote_code()),
-                    ("SYMB", ticker.as_str()),
-                ])
-        })
-        .await?
-        .json()
-        .await
-        .map_err(broker_err)?;
-        if body.rt_cd != "0" {
-            return Err(DomainError::Broker(format!(
-                "KIS quote rt_cd={} {}",
-                body.rt_cd, body.msg1
-            )));
-        }
+        let token = self.session.token().await?;
+        let body: KisQuoteResp = self
+            .session
+            .send_with_retry_json(|| {
+                self.session
+                    .authed(
+                        Method::GET,
+                        "/uapi/overseas-price/v1/quotations/price",
+                        "HHDFS00000300",
+                        &token,
+                    )
+                    .query(&[
+                        ("AUTH", ""),
+                        ("EXCD", self.config.exchange.quote_code()),
+                        ("SYMB", ticker.as_str()),
+                    ])
+            })
+            .await?;
+        check_rt("quote", &body.rt_cd, &body.msg1)?;
         let price = parse_price_opt(&body.output.last)?
             .ok_or_else(|| DomainError::Broker(format!("KIS returned no price for {ticker}")))?;
         Ok(Quote {
@@ -351,7 +253,7 @@ impl AccountQuery for KisBroker {
     }
 
     async fn fills_since(&self, ticker: &Ticker, since: time::Date) -> Result<Vec<Fill>> {
-        let token = self.token().await?;
+        let token = self.session.token().await?;
         // Clamp a corrupt/future watermark so we never send ORD_STRT_DT > ORD_END_DT.
         let today = today_utc();
         let start = yyyymmdd(since.min(today));
@@ -369,57 +271,45 @@ impl AccountQuery for KisBroker {
         let mut fills = Vec::new();
         let (mut fk, mut nk, mut tr_cont) = (String::new(), String::new(), String::new());
         for _ in 0..MAX_CCNL_PAGES {
-            // NOT wrapped in `send_with_retry`: this read accumulates fills across pages, and the
-            // reconcile path applies each fill without de-duping by execution id, so a re-returned
-            // page would be folded twice → over-counted fills → over-buy. A transient 5xx here
-            // aborts the tick instead (conservative — no placement on a stale ledger; the next
-            // fire retries). Single-shot reads (quote, balance) do retry.
-            self.limiter.acquire().await;
+            // `send_once` (no retry): this paginated read accumulates fills, and reconcile folds
+            // each without de-duping by execution id, so a re-returned page would over-count →
+            // over-buy. See `KisSession::send_once`.
             let resp = self
-                .client
-                .get(format!(
-                    "{}/uapi/overseas-stock/v1/trading/inquire-ccnl",
-                    self.base
-                ))
-                .header("authorization", format!("Bearer {token}"))
-                .header("appkey", &self.config.app_key)
-                .header("appsecret", &self.config.app_secret)
-                .header("tr_id", self.config.environment.exec_tr_id())
-                .header("custtype", "P")
-                .header("tr_cont", tr_cont.as_str())
-                .query(&[
-                    ("CANO", self.config.cano.as_str()),
-                    ("ACNT_PRDT_CD", self.config.product_code.as_str()),
-                    ("PDNO", pdno),
-                    ("ORD_STRT_DT", start.as_str()),
-                    ("ORD_END_DT", end.as_str()),
-                    ("SLL_BUY_DVSN", "00"),
-                    ("CCLD_NCCS_DVSN", "00"),
-                    ("OVRS_EXCG_CD", excg),
-                    ("SORT_SQN", "DS"),
-                    ("ORD_DT", ""),
-                    ("ORD_GNO_BRNO", ""),
-                    ("ODNO", ""),
-                    ("CTX_AREA_FK200", fk.as_str()),
-                    ("CTX_AREA_NK200", nk.as_str()),
-                ])
-                .send()
-                .await
-                .map_err(broker_err)?
-                .error_for_status()
-                .map_err(broker_err)?;
+                .session
+                .send_once(
+                    self.session
+                        .authed(
+                            Method::GET,
+                            "/uapi/overseas-stock/v1/trading/inquire-ccnl",
+                            self.config.environment.exec_tr_id(),
+                            &token,
+                        )
+                        .header("tr_cont", tr_cont.as_str())
+                        .query(&[
+                            ("CANO", self.config.cano.as_str()),
+                            ("ACNT_PRDT_CD", self.config.product_code.as_str()),
+                            ("PDNO", pdno),
+                            ("ORD_STRT_DT", start.as_str()),
+                            ("ORD_END_DT", end.as_str()),
+                            ("SLL_BUY_DVSN", "00"),
+                            ("CCLD_NCCS_DVSN", "00"),
+                            ("OVRS_EXCG_CD", excg),
+                            ("SORT_SQN", "DS"),
+                            ("ORD_DT", ""),
+                            ("ORD_GNO_BRNO", ""),
+                            ("ODNO", ""),
+                            ("CTX_AREA_FK200", fk.as_str()),
+                            ("CTX_AREA_NK200", nk.as_str()),
+                        ]),
+                )
+                .await?;
             // The continuation flag is a response *header*: `M`/`F` mean more pages follow.
             let more = matches!(
                 resp.headers().get("tr_cont").and_then(|v| v.to_str().ok()),
                 Some("M") | Some("F")
             );
             let body: KisExecResp = resp.json().await.map_err(broker_err)?;
-            if body.rt_cd != "0" {
-                return Err(DomainError::Broker(format!(
-                    "KIS inquire-ccnl rt_cd={} {}",
-                    body.rt_cd, body.msg1
-                )));
-            }
+            check_rt("inquire-ccnl", &body.rt_cd, &body.msg1)?;
             for row in &body.output {
                 // Skip other tickers (a paper query returns the whole account) and any row
                 // with nothing filled yet.
@@ -478,7 +368,7 @@ impl OrderGateway for KisBroker {
             .limit
             .map(|price| price.value().round_dp(2).normalize().to_string())
             .unwrap_or_else(|| "0".to_string());
-        let token = self.token().await?;
+        let token = self.session.token().await?;
         let body = json!({
             "CANO": self.config.cano,
             "ACNT_PRDT_CD": self.config.product_code,
@@ -490,33 +380,25 @@ impl OrderGateway for KisBroker {
             "ORD_DVSN": ord_dvsn,
         });
         // Only the order summary is logged — never the auth headers or secrets.
-        self.limiter.acquire().await;
+        // `send_once` (no retry): an order is a write with no client idempotency key, so a retry
+        // could double-place (#20). See `KisSession::send_once`.
         let resp: KisOrderResp = self
-            .client
-            .post(format!(
-                "{}/uapi/overseas-stock/v1/trading/order",
-                self.base
-            ))
-            .header("authorization", format!("Bearer {token}"))
-            .header("appkey", &self.config.app_key)
-            .header("appsecret", &self.config.app_secret)
-            .header("tr_id", self.config.environment.order_tr_id(order.side))
-            .header("custtype", "P")
-            .json(&body)
-            .send()
-            .await
-            .map_err(broker_err)?
-            .error_for_status()
-            .map_err(broker_err)?
+            .session
+            .send_once(
+                self.session
+                    .authed(
+                        Method::POST,
+                        "/uapi/overseas-stock/v1/trading/order",
+                        self.config.environment.order_tr_id(order.side),
+                        &token,
+                    )
+                    .json(&body),
+            )
+            .await?
             .json()
             .await
             .map_err(broker_err)?;
-        if resp.rt_cd != "0" {
-            return Err(DomainError::Broker(format!(
-                "KIS order rt_cd={} {}",
-                resp.rt_cd, resp.msg1
-            )));
-        }
+        check_rt("order", &resp.rt_cd, &resp.msg1)?;
         // ODNO is the required order number; prefix the KRX forwarding org number when
         // present so a later reconcile/cancel has both parts.
         let odno = resp.output.odno.trim();
@@ -541,13 +423,6 @@ impl OrderGateway for KisBroker {
                 .into(),
         ))
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct KisToken {
-    access_token: String,
-    #[serde(default)]
-    expires_in: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -664,27 +539,21 @@ mod tests {
     }
 
     fn broker(base: String) -> KisBroker {
+        let config = config();
         KisBroker {
-            config: config(),
-            base,
-            client: reqwest::Client::new(),
-            tokens: TokenCache::new(),
-            limiter: Arc::new(RateLimiter::new(Duration::ZERO, None)),
-            retry_backoff: Duration::ZERO,
+            session: KisSession::for_test(&config, base),
+            config,
         }
     }
 
     fn broker_with(env: KisEnv, base: String) -> KisBroker {
+        let config = KisConfig {
+            environment: env,
+            ..config()
+        };
         KisBroker {
-            config: KisConfig {
-                environment: env,
-                ..config()
-            },
-            base,
-            client: reqwest::Client::new(),
-            tokens: TokenCache::new(),
-            limiter: Arc::new(RateLimiter::new(Duration::ZERO, None)),
-            retry_backoff: Duration::ZERO,
+            session: KisSession::for_test(&config, base),
+            config,
         }
     }
 
