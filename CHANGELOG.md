@@ -32,6 +32,14 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
   position whose scheduled time has already passed when the daemon starts is caught up
   immediately (idempotently, only within the trading window); one position's failure is logged
   and never stops the others; SIGINT/SIGTERM stops it cleanly between fires.
+- **Domestic KRX trading (한국투자증권 국내).** A `kis-domestic` broker places and reconciles on
+  the Korean exchange (KRX) — the live path on a KRW-funded 모의 account, since overseas USD
+  orders cannot fill there. `drip tick --execute --name <kr-position>` places 지정가 (limit)
+  orders at each leg's price, rounded to the KRX ETF tick; `drip reconcile` folds domestic fills
+  (via KIS's daily-execution endpoint) so the tranche counter `T` advances day to day. **모의
+  only** — a real domestic account is refused (a deliberate, separate go-live).
+- **`drip fills` — print broker-reported executions.** A read-only diagnostic listing a
+  position's fills (date, side, qty, price) straight from the broker, without touching the ledger.
 
 ### Changed
 
@@ -43,9 +51,10 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
 - **`drip tick` now reconciles settled fills before deciding**, so today's tranche is computed
   from an up-to-date ledger rather than a stale one. A preview reconciles in-memory (no state
   write — like `dry-run`); `--execute` and the standalone `drip reconcile` persist the advance.
-- **The idempotency key and reconcile boundary now use the US Eastern trading date, not UTC.**
-  An Eastern session runs into the next UTC day, so a UTC key flipped after the close and risked
-  a double-place on an after-hours rerun; keying on the Eastern date (DST-aware) is stable.
+- **The idempotency key and reconcile boundary now use the market's trading date, not UTC.**
+  An exchange session runs into a different UTC day, so a UTC key flipped after the close and
+  risked a double-place on an after-hours rerun; keying on the market session date is stable —
+  US **Eastern** (DST-aware) for US equities, **KST** (UTC+9, no DST) for KRX.
 
 ### Fixed
 
@@ -71,4 +80,7 @@ backtesting, read-only KIS/Toss adapters, the CLI, and a read-only web dashboard
 > day is past), which is exact for drip's day orders (LOC / day-limit) but not intended for
 > intraday partial-fill precision. The scheduler fires on a daily cadence only — realtime
 > triggers (on tick / on price-cross) arrive with the M3 WebSocket feed. Toss order placement is
-> not supported (read-only positions are skipped by `drip run`).
+> not supported (read-only positions are skipped by `drip run`). **Domestic (KRX) placement is
+> 모의-only** (a real domestic account is refused) and is **not yet wired into `drip run`** — the
+> daemon's schedule + holiday calendar are US-only, so domestic positions run via `drip tick` for
+> now.
