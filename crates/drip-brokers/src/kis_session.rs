@@ -153,7 +153,13 @@ impl KisSession {
     /// Begin an authenticated KIS request: `{base}{path}` with the standard five-header preamble
     /// (`authorization`/`appkey`/`appsecret`/`tr_id`/`custtype`). The caller passes a `token`
     /// fetched once via [`KisSession::token`] and chains query/body/extra headers (e.g. `tr_cont`).
-    /// `custtype` is hardcoded to individual (`"P"`) — corporate accounts are #8.
+    ///
+    /// `custtype` is `"P"`, and that is correct for every account drip drives — not a stub. The
+    /// KIS REST auth reference (`koreainvestment/open-trading-api`, `backtester/kis_auth.py`)
+    /// applies `"P"` to **both** 개인 (individual) and 법인 (corporate) own-account customers;
+    /// `"B"` is only for a 제휴사 (an API-redistribution affiliate), which a single-user CLI is
+    /// not. (#8 proposed making this configurable as "B = corporate"; that premise came from the
+    /// WebSocket sample's comment, which the REST reference contradicts — so #8 was closed.)
     pub(crate) fn authed(
         &self,
         method: Method,
