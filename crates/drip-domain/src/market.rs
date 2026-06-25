@@ -40,6 +40,15 @@ impl AccountId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The secret-store key for one of an account's credential fields — e.g.
+    /// (`kis-paper`, `app_key`) → `kis-paper_app_key`. The single owner of the credential-key
+    /// namespacing scheme, so the broker connection (the reader) and the CLI / migration (the
+    /// writers) cannot drift on the separator across crates. Underscore, never a dot — dots nest
+    /// in TOML, which would break the flat secret store.
+    pub fn secret_key(account: &str, field: &str) -> String {
+        format!("{account}_{field}")
+    }
 }
 impl fmt::Display for AccountId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -6,7 +6,9 @@
 //! objects so use cases can stay broker-agnostic.
 
 use crate::{KisBroker, KisConfig, KisDomesticBroker, KisEnv, KisExchange, TossBroker, TossConfig};
-use drip_domain::{AccountQuery, DomainError, OrderGateway, Quotes, Result, SecretStore};
+use drip_domain::{
+    AccountId, AccountQuery, DomainError, OrderGateway, Quotes, Result, SecretStore,
+};
 use std::path::Path;
 
 /// A connected live broker, dispatching the read-only ports to the concrete adapter.
@@ -117,9 +119,9 @@ pub fn parse_exchange(raw: &str) -> Result<KisExchange> {
     }
 }
 
-/// Fetch a required account-scoped secret, keyed `{account}_{field}`.
+/// Fetch a required account-scoped secret, keyed by [`AccountId::secret_key`].
 fn require(secrets: &dyn SecretStore, account: &str, field: &str) -> Result<String> {
-    let key = format!("{account}_{field}");
+    let key = AccountId::secret_key(account, field);
     secrets.get(&key)?.ok_or_else(|| {
         DomainError::Config(format!(
             "missing secret '{key}' — run `drip account add` first"

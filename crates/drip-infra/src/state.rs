@@ -11,14 +11,10 @@ use drip_domain::{
 use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
 
-/// The positions table schema, keyed by `(account, ticker)`. Shared with [`crate::migrate`] so
-/// the migration's rebuilt table and `open`'s create-if-absent never drift.
-pub(crate) const POSITIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS positions (
-    account TEXT NOT NULL,
-    ticker  TEXT NOT NULL,
-    data    TEXT NOT NULL,
-    PRIMARY KEY (account, ticker)
-)";
+/// The columns + primary key of the positions table, keyed by `(account, ticker)`. Shared with
+/// [`crate::migrate`] (which rebuilds the table under a temporary name) so the two `CREATE TABLE`
+/// statements can never drift on the schema.
+pub(crate) const POSITIONS_COLUMNS: &str = "account TEXT NOT NULL, ticker TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (account, ticker)";
 
 /// Persists positions in a sqlite database file.
 #[derive(Debug, Clone)]
@@ -30,7 +26,11 @@ impl SqliteStateRepository {
     pub fn open(path: PathBuf) -> Result<SqliteStateRepository> {
         let repo = SqliteStateRepository { path };
         let conn = repo.conn()?;
-        conn.execute(POSITIONS_DDL, []).map_err(storage_err)?;
+        conn.execute(
+            &format!("CREATE TABLE IF NOT EXISTS positions ({POSITIONS_COLUMNS})"),
+            [],
+        )
+        .map_err(storage_err)?;
         // Idempotency ledger for placed orders (M2). `order_id` is null between the reserve
         // and the broker's acceptance; `at` is a unix timestamp for later housekeeping.
         conn.execute(

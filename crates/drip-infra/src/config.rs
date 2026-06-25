@@ -106,6 +106,17 @@ impl AppConfig {
         self.accounts.iter().find(|a| a.name == name)
     }
 
+    /// The configured environment (`paper`|`real`) for `account`, defaulting to `paper` when the
+    /// account isn't registered. The single home for this safety default: the broker connection is
+    /// account-scoped, so the 모의/실전 choice must resolve identically for every driving adapter
+    /// (CLI and web). `status` reads [`find_account`](AppConfig::find_account) directly because it
+    /// must distinguish a missing account from a paper one.
+    pub fn env_for(&self, account: &str) -> String {
+        self.find_account(account)
+            .map(|a| a.env.clone())
+            .unwrap_or_else(|| "paper".to_string())
+    }
+
     /// Insert a position, replacing any existing one with the same name.
     pub fn upsert(&mut self, position: PositionConfig) {
         match self.positions.iter_mut().find(|p| p.name == position.name) {

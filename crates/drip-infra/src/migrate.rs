@@ -15,6 +15,7 @@
 //! step leaves the env signal intact for a clean re-run.
 
 use crate::config::{AccountConfig, AppConfig};
+use crate::state::POSITIONS_COLUMNS;
 use drip_domain::{AccountId, DomainError, Position, Result, SecretStore};
 use rusqlite::Connection;
 use std::collections::BTreeMap;
@@ -100,15 +101,8 @@ fn migrate_state(state_path: &Path, env: &str) -> Result<Option<PathBuf>> {
     std::fs::copy(state_path, &backup)
         .map_err(|e| DomainError::Storage(format!("back up state.db: {e}")))?;
 
-    conn.execute_batch(
-        "CREATE TABLE positions_new (
-            account TEXT NOT NULL,
-            ticker  TEXT NOT NULL,
-            data    TEXT NOT NULL,
-            PRIMARY KEY (account, ticker)
-        )",
-    )
-    .map_err(storage_err)?;
+    conn.execute_batch(&format!("CREATE TABLE positions_new ({POSITIONS_COLUMNS})"))
+        .map_err(storage_err)?;
 
     for (broker, data) in legacy {
         // Legacy JSON has no `account` (serde default ""): set it from broker + env, re-serialize,
@@ -194,9 +188,9 @@ fn migrate_secrets(secrets: &dyn SecretStore, env: &str) -> Result<()> {
     }
     let account = format!("kis-{env}");
     for field in ["app_key", "app_secret", "cano", "product_code", "exchange"] {
-        let old = format!("kis_{field}");
+        let old = format!("kis_{field}"); // the legacy flat key, read for the last time
         if let Some(value) = secrets.get(&old)? {
-            secrets.set(&format!("{account}_{field}"), &value)?;
+            secrets.set(&AccountId::secret_key(&account, field), &value)?;
             secrets.delete(&old)?;
         }
     }

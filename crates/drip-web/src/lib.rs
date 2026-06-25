@@ -71,7 +71,7 @@ async fn api_quote(
     Query(q): Query<QuoteQuery>,
 ) -> Result<Json<Quote>, ApiError> {
     let secrets = FileSecretStore::new(s.secrets_path.clone());
-    let env = account_env(&s.config_path, &q.account)?;
+    let env = AppConfig::load(&s.config_path)?.env_for(&q.account);
     let live = connect(
         &q.broker,
         &q.account,
@@ -95,7 +95,7 @@ async fn api_account(
     Query(q): Query<AccountQuery>,
 ) -> Result<Json<AccountView>, ApiError> {
     let secrets = FileSecretStore::new(s.secrets_path.clone());
-    let env = account_env(&s.config_path, &q.account)?;
+    let env = AppConfig::load(&s.config_path)?.env_for(&q.account);
     let live = connect(
         &q.broker,
         &q.account,
@@ -104,15 +104,6 @@ async fn api_account(
         s.secrets_path.parent(),
     )?;
     Ok(Json(drip_app::account_snapshot(live.as_account()).await?))
-}
-
-/// The configured environment (`paper`|`real`) for `account`, defaulting to `paper` when the
-/// account isn't registered — needed to build the account-scoped broker connection.
-fn account_env(config_path: &std::path::Path, account: &str) -> Result<String, ApiError> {
-    Ok(AppConfig::load(config_path)?
-        .find_account(account)
-        .map(|a| a.env.clone())
-        .unwrap_or_else(|| "paper".to_string()))
 }
 
 #[derive(Deserialize)]

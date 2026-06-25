@@ -11,7 +11,7 @@ use drip_app::{
 };
 use drip_brokers::{LiveBroker, connect};
 use drip_domain::calendar::{Market, trading_date};
-use drip_domain::{Position, Schedule, StateRepository, Strategy, Ticker, Trigger};
+use drip_domain::{AccountId, Position, Schedule, StateRepository, Strategy, Ticker, Trigger};
 use drip_infra::{
     AccountConfig, AppConfig, CsvMarketData, FileSecretStore, PositionConfig,
     SqliteStateRepository, parse_date,
@@ -305,7 +305,7 @@ async fn cmd_account(
                 ("product_code", &product_code),
                 ("exchange", &exchange),
             ] {
-                secrets.set(&format!("{name}_{field}"), value)?;
+                secrets.set(&AccountId::secret_key(&name, field), value)?;
             }
             register_account(config_path, &name, &env)?;
             println!("Stored KIS account '{name}' ({env}).");
@@ -317,14 +317,17 @@ async fn cmd_account(
             app_secret,
             account_seq,
         } => {
-            secrets.set(&format!("{name}_app_key"), &app_key)?;
-            secrets.set(&format!("{name}_app_secret"), &app_secret)?;
-            secrets.set(&format!("{name}_account_seq"), &account_seq.to_string())?;
+            secrets.set(&AccountId::secret_key(&name, "app_key"), &app_key)?;
+            secrets.set(&AccountId::secret_key(&name, "app_secret"), &app_secret)?;
+            secrets.set(
+                &AccountId::secret_key(&name, "account_seq"),
+                &account_seq.to_string(),
+            )?;
             register_account(config_path, &name, "paper")?;
             println!("Stored Toss account '{name}'.");
         }
         AccountAction::Show { name, broker } => {
-            let env = env_for(&AppConfig::load(config_path)?, &name);
+            let env = AppConfig::load(config_path)?.env_for(&name);
             let live = connect(
                 &broker,
                 &name,
@@ -363,15 +366,6 @@ async fn probe_account(broker: &str, account: &str, env: &str, secrets: &FileSec
     }
 }
 
-/// The configured environment (`paper`|`real`) for `account`, defaulting to `paper` when the
-/// account isn't registered. Needed to build the account-scoped broker connection.
-fn env_for(config: &AppConfig, account: &str) -> String {
-    config
-        .find_account(account)
-        .map(|a| a.env.clone())
-        .unwrap_or_else(|| "paper".to_string())
-}
-
 async fn cmd_quote(
     ticker: &str,
     account: &str,
@@ -379,7 +373,7 @@ async fn cmd_quote(
     secrets: &FileSecretStore,
     config_path: &Path,
 ) -> Result<()> {
-    let env = env_for(&AppConfig::load(config_path)?, account);
+    let env = AppConfig::load(config_path)?.env_for(account);
     let live = connect(
         broker,
         account,
@@ -474,7 +468,7 @@ async fn cmd_dry_run(
     let position = config
         .find(name)
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
-    let env = env_for(&config, &position.account);
+    let env = config.env_for(&position.account);
     let live = connect(
         &position.broker,
         &position.account,
@@ -524,7 +518,7 @@ async fn cmd_tick(
     // repeated ticks no longer over-buy. A real domestic account is still fenced downstream in
     // `place()` (a deliberate go-live step); `drip run` still skips domestic (its schedule is
     // US-Eastern-only — #22 P4).
-    let env = env_for(&config, &position.account);
+    let env = config.env_for(&position.account);
     let live_broker = connect(
         &position.broker,
         &position.account,
@@ -580,7 +574,7 @@ async fn cmd_reconcile(
     let position = config
         .find(name)
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
-    let env = env_for(&config, &position.account);
+    let env = config.env_for(&position.account);
     let live = connect(
         &position.broker,
         &position.account,
@@ -612,7 +606,7 @@ async fn cmd_fills(
     let position = config
         .find(name)
         .ok_or_else(|| anyhow!("no position '{name}' — add one with `drip strategy add`"))?;
-    let env = env_for(&config, &position.account);
+    let env = config.env_for(&position.account);
     let live = connect(
         &position.broker,
         &position.account,
@@ -694,7 +688,7 @@ async fn cmd_run(
             );
             continue;
         }
-        let env = env_for(&config, &pc.account);
+        let env = config.env_for(&pc.account);
         let broker = connect(
             &pc.broker,
             &pc.account,
